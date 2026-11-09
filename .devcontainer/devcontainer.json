@@ -1,0 +1,18 @@
+{
+  "name": "aetherpay-infra",
+  "image": "mcr.microsoft.com/devcontainers/python:1-3.12-bookworm",
+  "features": {
+    "ghcr.io/devcontainers/features/terraform:1": {
+      "version": "1.17.1",
+      "tflint": "0.59.1"
+    },
+    "ghcr.io/devcontainers/features/aws-cli:1": {},
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+  },
+  "postCreateCommand": "pip install --user checkov==3.2.* -r app/requirements-dev.txt",
+  "customizations": {
+    "vscode": {
+      "extensions": ["hashicorp.terraform", "ms-python.python", "charliermarsh.ruff"]
+    }
+  }
+}
