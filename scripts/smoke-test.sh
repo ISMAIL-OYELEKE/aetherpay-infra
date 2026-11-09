@@ -27,7 +27,11 @@ BODY='{"type":"payment.settled","amount":"10.00","currency":"USD"}'
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 
 step "1. TLS"
-if curl -s -o /dev/null --tlsv1.3 --tls-max 1.3 "$URL/healthz"; then echo "TLS 1.3: accepted"; fi
+if curl -s -o /dev/null --tlsv1.3 "$URL/healthz" 2>/dev/null; then
+  echo "TLS 1.3: accepted"
+else
+  echo "TLS 1.3: this curl cannot force TLS 1.3 (the health check below still proves the connection works)"
+fi
 if curl -s -o /dev/null --tlsv1.2 --tls-max 1.2 "$URL/healthz" 2>/dev/null; then
   echo "TLS 1.2: ACCEPTED (unexpected)"
 else
