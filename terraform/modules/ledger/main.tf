@@ -64,6 +64,8 @@ data "aws_caller_identity" "current" {}
 locals {
   tags         = merge(var.tags, { "aetherpay:module" = "ledger", "aetherpay:data-class" = "financial-ledger" })
   account_root = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
+  # Service-linked role DynamoDB uses to replicate global tables.
+  replication_role_arn = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/aws-service-role/replication.dynamodb.amazonaws.com/AWSServiceRoleForDynamoDBReplication"
 }
 
 # ---------------------------------------------------------- multi-region CMK
@@ -71,6 +73,7 @@ data "aws_iam_policy_document" "key" {
   #checkov:skip=CKV_AWS_109:Key policy; Resource "*" means this key only.
   #checkov:skip=CKV_AWS_111:Key policy; Resource "*" means this key only.
   #checkov:skip=CKV_AWS_356:Key policy; Resource "*" means this key only.
+  #checkov:skip=CKV_AWS_33:The only Allow with principal "*" is pinned by aws:PrincipalArn to the DynamoDB replication role.
   statement {
     sid    = "AccountRootDelegatesToIam"
     effect = "Allow"
@@ -157,18 +160,42 @@ data "aws_iam_policy_document" "key" {
       values   = ["dynamodb.*.amazonaws.com"]
     }
 
+    # DynamoDB global-table replication runs as its service-linked role and
+    # calls KMS directly (no kms:ViaService), so it is exempt as well.
     condition {
       test     = "StringNotEquals"
       variable = "aws:PrincipalArn"
-      values   = [local.account_root]
+      values   = [local.account_root, local.replication_role_arn]
     }
 
-    # AWS services acting on their own behalf (DynamoDB replication) carry no
-    # kms:ViaService or principal ARN; without this they would be denied too.
+    # AWS services acting on their own behalf carry no kms:ViaService.
     condition {
       test     = "Bool"
       variable = "aws:PrincipalIsAWSService"
       values   = ["false"]
+    }
+  }
+
+  # The replication service-linked role needs the key to write replica items.
+  # Matched by condition, so the policy is valid before the role exists.
+  statement {
+    sid    = "AllowDynamoDbReplicationRole"
+    effect = "Allow"
+    actions = [
+      "kms:CreateGrant", "kms:Decrypt", "kms:DescribeKey", "kms:Encrypt",
+      "kms:GenerateDataKey", "kms:GenerateDataKeyWithoutPlaintext", "kms:ReEncryptFrom", "kms:ReEncryptTo",
+    ]
+    resources = ["*"]
+
+    principals {
+      type        = "AWS"
+      identifiers = ["*"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:PrincipalArn"
+      values   = [local.replication_role_arn]
     }
   }
 }
