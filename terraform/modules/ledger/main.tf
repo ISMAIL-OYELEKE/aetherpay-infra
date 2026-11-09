@@ -287,6 +287,15 @@ data "aws_iam_policy_document" "journal" {
       type        = "AWS"
       identifiers = ["*"]
     }
+
+    # DynamoDB's replication role must be able to apply every change from the
+    # other replica, deletes included. If this deny catches it, AWS marks the
+    # replica REPLICATION_NOT_AUTHORIZED and archives it after seven days.
+    condition {
+      test     = "StringNotEquals"
+      variable = "aws:PrincipalArn"
+      values   = [local.replication_role_arn]
+    }
   }
 }
 
