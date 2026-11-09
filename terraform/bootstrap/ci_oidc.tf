@@ -236,6 +236,7 @@ data "aws_iam_policy_document" "apply_iam" {
         "ecs-tasks.amazonaws.com",
         "lambda.amazonaws.com",
         "monitoring.rds.amazonaws.com",
+        "rds.amazonaws.com", # CreateDBInstance passes the enhanced-monitoring role to RDS
         "vpc-flow-logs.amazonaws.com",
       ]
     }
