@@ -12,6 +12,7 @@ from urllib.parse import urlencode
 import boto3
 import redis
 from botocore.awsrequest import AWSRequest
+from botocore.model import ServiceId
 from botocore.signers import RequestSigner
 
 TOKEN_TTL_SECONDS = 900
@@ -21,7 +22,7 @@ def iam_auth_token(replication_group_id: str, user: str, region: str, session=No
     session = session or boto3.session.Session()
     credentials = session.get_credentials()
     signer = RequestSigner(
-        service_id="elasticache",
+        service_id=ServiceId("elasticache"),  # botocore calls .hyphenize() on it
         region_name=region,
         signing_name="elasticache",
         signature_version="v4",
