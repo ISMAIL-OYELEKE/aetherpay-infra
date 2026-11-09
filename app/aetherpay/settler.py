@@ -11,7 +11,6 @@ import json
 import logging
 import signal
 import socket
-import time
 
 import boto3
 
@@ -37,26 +36,38 @@ def process(ledger: Ledger, message: dict, epoch: int | None) -> None:
     LOG.info("journal %s settlement=%s", "appended" if created else "duplicate", settlement_id)
 
 
+def poll_wait_seconds(lease_seconds: int, safety_margin: int) -> int:
+    """How long one SQS long poll may block while we hold the lease.
+
+    The lease is renewed once per loop, then checked after the poll. The poll
+    must therefore leave more than ``safety_margin`` of the lease, or the
+    worker fences itself on every loop even though nobody else has the lease.
+    """
+    return max(1, min(20, (lease_seconds - safety_margin) // 2))
+
+
 def run() -> None:
     s = Settings()
     sqs = boto3.client("sqs", region_name=s.region)
     ledger = Ledger(boto3.client("dynamodb", region_name=s.region), s.ledger_table, s.region)
     holder = f"{s.region}/{socket.gethostname()}"
     lease = None
-    last_renew = 0.0
+    wait = poll_wait_seconds(s.lease_seconds, s.lease_safety_margin_seconds)
 
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
 
     while _running:
-        if s.region_role == "primary" and time.monotonic() - last_renew > s.lease_seconds / 3:
-            lease = ledger.acquire_lease(SHARD, holder, s.lease_seconds)
-            last_renew = time.monotonic()
-            if lease is None:
+        if s.region_role == "primary":
+            held = lease is not None
+            lease = ledger.acquire_lease(SHARD, holder, s.lease_seconds)  # take or renew
+            if lease is None and held:
+                LOG.warning("lease taken over elsewhere; journaling only")
+            elif lease is None:
                 LOG.info("lease held elsewhere; journaling only")
 
         resp = sqs.receive_message(
-            QueueUrl=s.queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=20, VisibilityTimeout=120
+            QueueUrl=s.queue_url, MaxNumberOfMessages=10, WaitTimeSeconds=wait, VisibilityTimeout=120
         )
         for message in resp.get("Messages", []):
             process(ledger, message, lease.epoch if lease else None)

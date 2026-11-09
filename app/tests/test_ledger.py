@@ -95,3 +95,14 @@ def test_self_fence_when_lease_nearly_expired(db):
     lease = led.acquire_lease("settlement", "us-east-1/a", 30)
     with pytest.raises(LeaseLost, match="expiring"):
         led.assert_lease("settlement", lease, safety_margin=31)
+
+
+def test_settler_poll_leaves_room_for_the_safety_margin():
+    from aetherpay.settler import poll_wait_seconds
+
+    # Defaults: 30 s lease, 10 s margin. A 20 s poll would leave exactly the
+    # margin and fence the worker on every loop.
+    wait = poll_wait_seconds(30, 10)
+    assert 30 - wait > 10
+    assert poll_wait_seconds(300, 10) == 20  # never above the SQS maximum
+    assert poll_wait_seconds(5, 10) == 1
