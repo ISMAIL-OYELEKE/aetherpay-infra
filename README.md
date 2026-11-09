@@ -154,7 +154,7 @@ terraform/
 app/                      Python ingestor (FastAPI) and settler, Dockerfile, tests
 docs/                     ADR-001, vulnerability audit
 .github/workflows/        terraform-ci, terraform-apply, drift-detection, app-ci
-scripts/drift-alert.sh    Slack / PagerDuty notifier
+scripts/                  drift-alert.sh (Slack / PagerDuty), configure-github.sh (CI setup)
 ```
 
 ---
@@ -192,7 +192,13 @@ Then move the bootstrap state into the bucket it created: uncomment the `backend
 
 ### 2. Configure GitHub
 
-**Repository variables** (Settings, Secrets and variables, Actions, Variables):
+The quickest route is the helper script, which reads the bootstrap outputs and sets every variable below with the GitHub CLI:
+
+```bash
+scripts/configure-github.sh ISMAIL-OYELEKE/aetherpay-infra webhooks.staging.<your-domain> <route53-zone-id> oncall@<your-domain>
+```
+
+Or set them by hand. **Repository variables** (Settings, Secrets and variables, Actions, Variables):
 
 | Variable | Value |
 |---|---|
@@ -223,7 +229,7 @@ alarm_emails             = ["oncall@<your-domain>"]
 
 ### 3. Ship the first image and deploy staging
 
-1. Merge anything under `app/` (or re-run `app-ci` on `main`). The job summary prints `…/aetherpay/app@sha256:…`.
+1. Run the `app-ci` workflow on `main` (Actions, app-ci, Run workflow). The job summary prints `…/aetherpay/app@sha256:…`.
 2. Open a PR that sets `app_image` in [`terraform/environments/staging/image.auto.tfvars`](terraform/environments/staging/image.auto.tfvars).
 3. Review the plan comment, merge, and approve the `staging` environment. The pipeline applies the signed plan.
 

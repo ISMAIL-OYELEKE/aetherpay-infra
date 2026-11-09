@@ -11,6 +11,7 @@ on:
   push:
     branches: [main]
     paths: ["app/**"]
+  workflow_dispatch: # build the first image right after bootstrap
 
 permissions:
   contents: read
@@ -67,7 +68,7 @@ jobs:
           fail-build: true
 
       - name: configure AWS credentials (OIDC, image push role)
-        if: github.event_name == 'push'
+        if: github.event_name != 'pull_request'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_IMAGE_PUSH_ROLE_ARN }}
@@ -75,12 +76,12 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
 
       - name: login to ECR
-        if: github.event_name == 'push'
+        if: github.event_name != 'pull_request'
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: push immutable tag
         id: push
-        if: github.event_name == 'push'
+        if: github.event_name != 'pull_request'
         env:
           REPO: ${{ vars.ECR_REPOSITORY_URL }}
         run: |
@@ -91,14 +92,14 @@ jobs:
           echo "image=$REPO@$digest" >> "$GITHUB_OUTPUT"
 
       - uses: sigstore/cosign-installer@v3
-        if: github.event_name == 'push'
+        if: github.event_name != 'pull_request'
 
       - name: sign image (keyless)
-        if: github.event_name == 'push'
+        if: github.event_name != 'pull_request'
         run: cosign sign --yes "${{ steps.push.outputs.image }}"
 
       - name: promotion instructions
-        if: github.event_name == 'push'
+        if: github.event_name != 'pull_request'
         run: |
           {
             echo "### Image published"
