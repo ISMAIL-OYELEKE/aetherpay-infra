@@ -150,7 +150,7 @@ data "aws_iam_policy_document" "image_push_trust" {
     condition {
       test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${local.repo}:ref:refs/heads/main", "repo:${local.repo}:pull_request"]
+      values   = ["${local.oidc_subject_prefix}:ref:refs/heads/main", "${local.oidc_subject_prefix}:pull_request"]
     }
   }
 }

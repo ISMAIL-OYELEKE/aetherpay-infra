@@ -10,6 +10,16 @@ variable "github_repository" {
   default     = "ISMAIL-OYELEKE/aetherpay-infra"
 }
 
+variable "github_oidc_subject_prefix" {
+  description = <<-EOT
+    Prefix of the GitHub OIDC "sub" claim for this repository. Check it with
+    `gh api repos/<owner>/<repo>/actions/oidc/customization/sub`
+    (sub_claim_prefix). Null means the legacy "repo:<owner>/<repo>" form.
+  EOT
+  type        = string
+  default     = "repo:ISMAIL-OYELEKE@98213704/aetherpay-infra@1451362168"
+}
+
 variable "environments" {
   description = "Deployment environments that get dedicated plan/apply roles."
   type        = list(string)

@@ -22,7 +22,12 @@ data "aws_iam_openid_connect_provider" "github" {
 
 locals {
   oidc_provider_arn = var.create_github_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : data.aws_iam_openid_connect_provider.github[0].arn
-  repo              = var.github_repository
+
+  # GitHub's OIDC "sub" claim starts with this prefix. Repositories using
+  # immutable subjects embed the owner and repository IDs
+  # (repo:<owner>@<owner_id>/<repo>@<repo_id>), so a deleted-and-recreated or
+  # renamed repository with the same name cannot assume these roles.
+  oidc_subject_prefix = coalesce(var.github_oidc_subject_prefix, "repo:${var.github_repository}")
 }
 
 # ------------------------------------------------------------------ trust
@@ -47,8 +52,8 @@ data "aws_iam_policy_document" "plan_trust" {
       test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
       values = [
-        "repo:${local.repo}:pull_request",
-        "repo:${local.repo}:ref:refs/heads/main",
+        "${local.oidc_subject_prefix}:pull_request",
+        "${local.oidc_subject_prefix}:ref:refs/heads/main",
       ]
     }
   }
@@ -74,7 +79,7 @@ data "aws_iam_policy_document" "apply_trust" {
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${local.repo}:environment:${each.key}"]
+      values   = ["${local.oidc_subject_prefix}:environment:${each.key}"]
     }
   }
 }
