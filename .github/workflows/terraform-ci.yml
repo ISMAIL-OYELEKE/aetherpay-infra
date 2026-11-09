@@ -1,0 +1,266 @@
+# Pull-request pipeline for Terraform:
+#   1. static analysis (fmt, validate, terraform test, tflint) and policy-as-code
+#      (checkov). Any finding blocks the build.
+#   2. per-environment plan with keyless OIDC credentials. The binary plan is
+#      checksummed, signed with Sigstore (keyless) and uploaded as a short-lived
+#      artifact; the rendered plan is posted as a PR comment.
+#
+# The apply workflow later downloads THIS signed plan and applies exactly it.
+
+name: terraform-ci
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform-*.yml"
+      - ".tflint.hcl"
+      - ".checkov.yaml"
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - ".tflint.hcl"
+      - ".checkov.yaml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  TF_VERSION: "1.17.1"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  lint:
+    name: fmt + tflint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff terraform
+
+      - uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: v0.59.1
+
+      - name: tflint
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # avoids API rate limits when fetching the AWS ruleset
+        run: |
+          tflint --init --config="$GITHUB_WORKSPACE/.tflint.hcl"
+          tflint --chdir=terraform --recursive --config="$GITHUB_WORKSPACE/.tflint.hcl" --minimum-failure-severity=warning
+
+  test:
+    name: validate + terraform test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dir:
+          - terraform/bootstrap
+          - terraform/environments/staging
+          - terraform/environments/production
+          - terraform/modules/networking
+          - terraform/modules/workload-iam
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: init (no backend)
+        working-directory: ${{ matrix.dir }}
+        run: terraform init -backend=false -lockfile=readonly 2>/dev/null || terraform init -backend=false
+
+      - name: validate
+        working-directory: ${{ matrix.dir }}
+        run: terraform validate -no-color
+
+      - name: terraform test (offline, mocked providers)
+        working-directory: ${{ matrix.dir }}
+        run: |
+          if ls tests/*.tftest.hcl >/dev/null 2>&1; then
+            terraform test -no-color
+          else
+            echo "No tests in ${{ matrix.dir }}"
+          fi
+
+  security:
+    name: checkov (policy-as-code)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: terraform
+          config_file: .checkov.yaml
+          framework: terraform
+          output_format: cli,sarif
+          output_file_path: console,checkov.sarif
+          soft_fail: false # any failed check blocks the PR
+
+      - name: upload SARIF to code scanning
+        if: always() && hashFiles('checkov.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov.sarif
+          category: checkov
+
+  plan:
+    name: plan (${{ matrix.environment }})
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    needs: [lint, test, security]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC to AWS and Sigstore
+      pull-requests: write # plan comment
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [staging, production]
+    # One plan per environment per PR at a time; the S3 lock file also
+    # serialises against applies and drift checks.
+    concurrency:
+      group: terraform-plan-${{ matrix.environment }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    env:
+      ENV_UPPER: ${{ matrix.environment == 'staging' && 'STAGING' || 'PRODUCTION' }}
+      WORKDIR: terraform/environments/${{ matrix.environment }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      # Plan the PR head itself (not the synthetic merge commit), so the apply
+      # job can prove the merged code is byte-identical to what was planned.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: configure AWS credentials (OIDC, read-only plan role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars[format('AWS_PLAN_ROLE_ARN_{0}', env.ENV_UPPER)] }}
+          role-session-name: plan-${{ matrix.environment }}-pr${{ github.event.pull_request.number }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: write account-specific tfvars
+        working-directory: ${{ env.WORKDIR }}
+        env:
+          TFVARS: ${{ vars[format('TFVARS_{0}', env.ENV_UPPER)] }}
+        run: printf '%s\n' "$TFVARS" > ci.auto.tfvars
+
+      - name: init
+        working-directory: ${{ env.WORKDIR }}
+        run: |
+          terraform init -lockfile=readonly \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="kms_key_id=${{ vars.TF_STATE_KMS_KEY_ARN }}"
+
+      - name: plan
+        id: plan
+        working-directory: ${{ env.WORKDIR }}
+        run: |
+          set +e
+          terraform plan -lock-timeout=10m -detailed-exitcode -out=tfplan -no-color > plan.log 2>&1
+          code=$?
+          set -e
+          cat plan.log
+          if [ "$code" -eq 1 ]; then echo "::error::terraform plan failed"; exit 1; fi
+          echo "has_changes=$([ "$code" -eq 2 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          terraform show -no-color tfplan > plan.txt
+
+      - name: checksum + metadata
+        working-directory: ${{ env.WORKDIR }}
+        run: |
+          sha256sum tfplan > tfplan.sha256
+          jq -n \
+            --arg env "${{ matrix.environment }}" \
+            --arg head_sha "$HEAD_SHA" \
+            --arg pr "${{ github.event.pull_request.number }}" \
+            --arg tf "${{ env.TF_VERSION }}" \
+            --arg lock "$(sha256sum .terraform.lock.hcl | cut -d' ' -f1)" \
+            --arg changes "${{ steps.plan.outputs.has_changes }}" \
+            '{environment:$env, head_sha:$head_sha, pr:$pr, terraform_version:$tf, lockfile_sha256:$lock, has_changes:($changes=="true")}' \
+            > plan-metadata.json
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: sign plan (Sigstore keyless, bound to this workflow identity)
+        working-directory: ${{ env.WORKDIR }}
+        run: cosign sign-blob --yes --bundle tfplan.sigstore.json tfplan
+
+      - name: upload signed plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.environment }}-${{ env.HEAD_SHA }}
+          path: |
+            ${{ env.WORKDIR }}/tfplan
+            ${{ env.WORKDIR }}/tfplan.sha256
+            ${{ env.WORKDIR }}/tfplan.sigstore.json
+            ${{ env.WORKDIR }}/plan-metadata.json
+            ${{ env.WORKDIR }}/plan.txt
+          retention-days: 5
+          if-no-files-found: error
+
+      - name: comment plan on PR
+        uses: actions/github-script@v7
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+          HAS_CHANGES: ${{ steps.plan.outputs.has_changes }}
+          PLAN_PATH: ${{ env.WORKDIR }}/plan.txt
+        with:
+          script: |
+            const fs = require('fs');
+            const env = process.env.ENVIRONMENT;
+            const marker = `<!-- terraform-plan:${env} -->`;
+            let plan = fs.readFileSync(process.env.PLAN_PATH, 'utf8');
+            const max = 60000;
+            if (plan.length > max) plan = plan.slice(0, max) + '\n... (truncated, see the tfplan artifact)';
+            const summary = (plan.match(/Plan: .*|No changes\..*/) || ['(see details)'])[0];
+            const body = [
+              marker,
+              `### Terraform plan: \`${env}\``,
+              `**${summary}**`,
+              `Commit: \`${context.payload.pull_request.head.sha.slice(0, 7)}\` | signed artifact: \`tfplan-${env}-${context.payload.pull_request.head.sha}\` (5-day retention)`,
+              '',
+              '<details><summary>Show plan</summary>',
+              '',
+              '```hcl',
+              plan,
+              '```',
+              '</details>',
+              '',
+              process.env.HAS_CHANGES === 'true'
+                ? 'On merge, the apply workflow applies **exactly this signed plan** after environment approval.'
+                : 'No infrastructure changes.',
+            ].join('\n');
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+            const existing = comments.find(c => c.body && c.body.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }

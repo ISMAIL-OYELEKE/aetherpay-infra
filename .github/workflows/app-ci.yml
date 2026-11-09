@@ -1,0 +1,110 @@
+# Application pipeline: lint + test on every PR; on main, build once, scan,
+# push an immutable image to ECR with keyless OIDC, sign it, and print the
+# digest to promote (environments deploy by digest only).
+
+name: app-ci
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ["app/**", ".github/workflows/app-ci.yml"]
+  push:
+    branches: [main]
+    paths: ["app/**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: app-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: app/requirements-dev.txt
+
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: pytest -q
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: build
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          load: true
+          tags: aetherpay-app:ci
+          provenance: false
+
+      - name: vulnerability scan (blocks on fixable critical/high)
+        uses: anchore/scan-action@v6
+        with:
+          image: aetherpay-app:ci
+          severity-cutoff: high
+          only-fixed: true
+          fail-build: true
+
+      - name: configure AWS credentials (OIDC, image push role)
+        if: github.event_name == 'push'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_IMAGE_PUSH_ROLE_ARN }}
+          role-session-name: image-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: login to ECR
+        if: github.event_name == 'push'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: push immutable tag
+        id: push
+        if: github.event_name == 'push'
+        env:
+          REPO: ${{ vars.ECR_REPOSITORY_URL }}
+        run: |
+          tag="git-${GITHUB_SHA::12}"
+          docker tag aetherpay-app:ci "$REPO:$tag"
+          docker push "$REPO:$tag"
+          digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$REPO:$tag" | cut -d@ -f2)
+          echo "image=$REPO@$digest" >> "$GITHUB_OUTPUT"
+
+      - uses: sigstore/cosign-installer@v3
+        if: github.event_name == 'push'
+
+      - name: sign image (keyless)
+        if: github.event_name == 'push'
+        run: cosign sign --yes "${{ steps.push.outputs.image }}"
+
+      - name: promotion instructions
+        if: github.event_name == 'push'
+        run: |
+          {
+            echo "### Image published"
+            echo '```'
+            echo "${{ steps.push.outputs.image }}"
+            echo '```'
+            echo "Promote by opening a PR that sets \`app_image\` in"
+            echo "\`terraform/environments/staging/image.auto.tfvars\` to the value above."
+          } >> "$GITHUB_STEP_SUMMARY"

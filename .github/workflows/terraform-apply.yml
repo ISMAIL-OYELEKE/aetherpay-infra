@@ -1,0 +1,170 @@
+# Apply on merge to main, using ONLY the signed plan produced for the merged PR.
+#
+#   resolve: find the merged PR, its head commit and the terraform-ci run that
+#            planned it; refuse if the merged Terraform code differs from what
+#            was planned.
+#   apply:   per environment (staging, then production), behind a GitHub
+#            Environment with required reviewers. Downloads the plan, verifies
+#            the checksum and the Sigstore signature (must come from this repo's
+#            terraform-ci workflow), then runs `terraform apply tfplan`.
+#            There is no `terraform apply -auto-approve` anywhere.
+#
+# A plan made against an older state serial is rejected by Terraform itself
+# ("Saved plan is stale"), so a merge that raced another apply fails safely
+# and must be re-planned.
+
+name: terraform-apply
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: "1.17.1"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    outputs:
+      head_sha: ${{ steps.find.outputs.head_sha }}
+      run_id: ${{ steps.find.outputs.run_id }}
+      pr: ${{ steps.find.outputs.pr }}
+    steps:
+      - name: find merged PR and its plan run
+        id: find
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const prs = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: context.sha });
+            const pr = prs.data.find(p => p.merged_at && p.base.ref === 'main');
+            if (!pr) core.setFailed(`No merged PR for ${context.sha}: direct pushes to main are not applied. Open a PR.`);
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner, repo, workflow_id: 'terraform-ci.yml', event: 'pull_request', head_sha: pr.head.sha, status: 'success',
+            });
+            const run = runs.data.workflow_runs[0];
+            if (!run) core.setFailed(`No successful terraform-ci run for PR head ${pr.head.sha}.`);
+            core.setOutput('head_sha', pr.head.sha);
+            core.setOutput('run_id', String(run.id));
+            core.setOutput('pr', String(pr.number));
+            core.notice(`Applying plan from PR #${pr.number}, head ${pr.head.sha}, run ${run.id}`);
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: merged Terraform code must equal planned code
+        run: |
+          if ! git diff --quiet "${{ steps.find.outputs.head_sha }}" "${{ github.sha }}" -- terraform/; then
+            echo "::error::terraform/ on main differs from the planned PR head. Update the branch and re-plan."
+            git diff --stat "${{ steps.find.outputs.head_sha }}" "${{ github.sha }}" -- terraform/
+            exit 1
+          fi
+
+  apply:
+    name: apply (${{ matrix.environment }})
+    needs: resolve
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1 # staging first, then production
+      matrix:
+        environment: [staging, production]
+    environment: ${{ matrix.environment }} # required reviewers = approval gate
+    # Queue (never cancel) per environment; shared with drift detection.
+    concurrency:
+      group: terraform-state-${{ matrix.environment }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    env:
+      ENV_UPPER: ${{ matrix.environment == 'staging' && 'STAGING' || 'PRODUCTION' }}
+      WORKDIR: terraform/environments/${{ matrix.environment }}
+      HEAD_SHA: ${{ needs.resolve.outputs.head_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: download signed plan from the PR run
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ matrix.environment }}-${{ env.HEAD_SHA }}
+          path: ${{ env.WORKDIR }}
+          run-id: ${{ needs.resolve.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: check metadata
+        id: meta
+        working-directory: ${{ env.WORKDIR }}
+        run: |
+          jq . plan-metadata.json
+          test "$(jq -r .environment plan-metadata.json)" = "${{ matrix.environment }}"
+          test "$(jq -r .head_sha plan-metadata.json)" = "$HEAD_SHA"
+          test "$(jq -r .terraform_version plan-metadata.json)" = "$TF_VERSION"
+          test "$(jq -r .lockfile_sha256 plan-metadata.json)" = "$(sha256sum .terraform.lock.hcl | cut -d' ' -f1)"
+          echo "has_changes=$(jq -r .has_changes plan-metadata.json)" >> "$GITHUB_OUTPUT"
+
+      - name: verify checksum
+        working-directory: ${{ env.WORKDIR }}
+        run: sha256sum --check tfplan.sha256
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: verify Sigstore signature (must be signed by this repo's terraform-ci on a PR)
+        working-directory: ${{ env.WORKDIR }}
+        run: |
+          cosign verify-blob tfplan \
+            --bundle tfplan.sigstore.json \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/\.github/workflows/terraform-ci\.yml@refs/pull/${{ needs.resolve.outputs.pr }}/merge$"
+
+      - uses: hashicorp/setup-terraform@v3
+        if: steps.meta.outputs.has_changes == 'true'
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: configure AWS credentials (OIDC, environment-bound apply role)
+        if: steps.meta.outputs.has_changes == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars[format('AWS_APPLY_ROLE_ARN_{0}', env.ENV_UPPER)] }}
+          role-session-name: apply-${{ matrix.environment }}-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-duration-seconds: 7200
+
+      - name: init
+        if: steps.meta.outputs.has_changes == 'true'
+        working-directory: ${{ env.WORKDIR }}
+        run: |
+          terraform init -lockfile=readonly \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="kms_key_id=${{ vars.TF_STATE_KMS_KEY_ARN }}"
+
+      - name: apply the exact approved plan
+        if: steps.meta.outputs.has_changes == 'true'
+        working-directory: ${{ env.WORKDIR }}
+        run: terraform apply -lock-timeout=10m -no-color tfplan
+
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo "### ${{ matrix.environment }}"
+            echo "- PR: #${{ needs.resolve.outputs.pr }} (head \`${HEAD_SHA:0:7}\`)"
+            echo "- Changes: ${{ steps.meta.outputs.has_changes }}"
+            echo "- Result: ${{ job.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"

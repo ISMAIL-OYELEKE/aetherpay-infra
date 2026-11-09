@@ -1,0 +1,124 @@
+# Scheduled drift detection.
+#
+# `terraform plan -detailed-exitcode` returns:
+#   0  clean       state matches reality
+#   1  error       plan could not run (auth, provider, lock, syntax)
+#   2  drift       someone changed infrastructure outside Terraform
+#
+# Errors and drift both alert Slack and PagerDuty (different severities) and
+# fail the job, so the run history shows red until it is fixed.
+
+name: drift-detection
+
+on:
+  schedule:
+    - cron: "17 */6 * * *" # every 6 hours, off the top of the hour
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: "1.17.1"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  drift:
+    name: drift (${{ matrix.environment }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [staging, production]
+    # Same group as the apply workflow: drift checks wait for an apply to finish.
+    concurrency:
+      group: terraform-state-${{ matrix.environment }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ENV_UPPER: ${{ matrix.environment == 'staging' && 'STAGING' || 'PRODUCTION' }}
+      WORKDIR: terraform/environments/${{ matrix.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: configure AWS credentials (OIDC, read-only plan role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars[format('AWS_PLAN_ROLE_ARN_{0}', env.ENV_UPPER)] }}
+          role-session-name: drift-${{ matrix.environment }}-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: write account-specific tfvars
+        working-directory: ${{ env.WORKDIR }}
+        env:
+          TFVARS: ${{ vars[format('TFVARS_{0}', env.ENV_UPPER)] }}
+        run: printf '%s\n' "$TFVARS" > ci.auto.tfvars
+
+      - name: init
+        working-directory: ${{ env.WORKDIR }}
+        run: |
+          terraform init -lockfile=readonly \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="kms_key_id=${{ vars.TF_STATE_KMS_KEY_ARN }}"
+
+      - name: plan -detailed-exitcode
+        id: plan
+        working-directory: ${{ env.WORKDIR }}
+        run: |
+          set +e
+          terraform plan -detailed-exitcode -lock-timeout=10m -no-color -out=drift.tfplan > drift.log 2>&1
+          code=$?
+          set -e
+          cat drift.log
+          case "$code" in
+            0) status=clean ;;
+            2) status=drift
+               terraform show -json drift.tfplan \
+                 | jq -r '.resource_changes[] | select(.change.actions != ["no-op"]) | "\(.change.actions | join("/")) \(.address)"' \
+                 > drifted.txt ;;
+            *) status=error ;;
+          esac
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Drift check: ${{ matrix.environment }}"
+            echo "- exit code: \`$code\` (**$status**)"
+            if [ -s drifted.txt ]; then echo '```'; cat drifted.txt; echo '```'; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: upload drift report
+        if: steps.plan.outputs.status != 'clean'
+        uses: actions/upload-artifact@v4
+        with:
+          name: drift-${{ matrix.environment }}-${{ github.run_id }}
+          path: |
+            ${{ env.WORKDIR }}/drift.log
+            ${{ env.WORKDIR }}/drifted.txt
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: alert Slack and PagerDuty
+        if: steps.plan.outputs.status != 'clean'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          PAGERDUTY_ROUTING_KEY: ${{ secrets.PAGERDUTY_ROUTING_KEY }}
+          STATUS: ${{ steps.plan.outputs.status }}
+          EXIT_CODE: ${{ steps.plan.outputs.exit_code }}
+          ENVIRONMENT: ${{ matrix.environment }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DRIFT_FILE: ${{ env.WORKDIR }}/drifted.txt
+        run: scripts/drift-alert.sh
+
+      - name: fail on drift or error
+        if: steps.plan.outputs.status != 'clean'
+        run: |
+          echo "::error::${{ matrix.environment }}: ${{ steps.plan.outputs.status }} (exit ${{ steps.plan.outputs.exit_code }})"
+          exit 1
