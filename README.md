@@ -188,7 +188,7 @@ terraform apply                      # creates state bucket, CMK, OIDC roles, bo
 terraform output                     # values for the next steps
 ```
 
-Then move the bootstrap state into the bucket it created: uncomment the `backend "s3"` block in `bootstrap/versions.tf`, set the bucket name, and run `terraform init -migrate-state`.
+Then move the bootstrap state into the bucket it created: copy the commented `backend "s3"` block from `bootstrap/versions.tf` into a local `backend_override.tf` (git-ignored, so account IDs stay out of the repo), fill in the bucket name and `kms_key_id` (the bucket policy rejects writes that do not name the state key), and run `terraform init -migrate-state`. If your account already has the GitHub OIDC provider, add `-var create_github_oidc_provider=false` to the apply.
 
 ### 2. Configure GitHub
 

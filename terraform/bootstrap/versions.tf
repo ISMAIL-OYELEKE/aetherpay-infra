@@ -17,6 +17,7 @@ terraform {
   #   key          = "bootstrap/terraform.tfstate"
   #   region       = "us-east-1"
   #   encrypt      = true
+  #   kms_key_id   = "<state_kms_key_arn output>" # bucket policy rejects other keys
   #   use_lockfile = true
   # }
 }
