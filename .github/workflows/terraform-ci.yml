@@ -240,9 +240,10 @@ jobs:
             const env = process.env.ENVIRONMENT;
             const marker = `<!-- terraform-plan:${env} -->`;
             let plan = fs.readFileSync(process.env.PLAN_PATH, 'utf8');
+            // Read the summary line from the full plan, before any truncation.
+            const summary = (plan.match(/Plan: .*|No changes\..*/) || ['(see details)'])[0];
             const max = 60000;
             if (plan.length > max) plan = plan.slice(0, max) + '\n... (truncated, see the tfplan artifact)';
-            const summary = (plan.match(/Plan: .*|No changes\..*/) || ['(see details)'])[0];
             const body = [
               marker,
               `### Terraform plan: \`${env}\``,
@@ -257,7 +258,7 @@ jobs:
               '</details>',
               '',
               process.env.HAS_CHANGES === 'true'
-                ? 'On merge, the apply workflow applies **exactly this signed plan** after environment approval.'
+                ? 'On merge, the apply workflow applies **exactly this signed plan** after a human approves it on the approval issue.'
                 : 'No infrastructure changes.',
             ].join('\n');
             const { owner, repo } = context.repo;
