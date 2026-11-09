@@ -195,10 +195,18 @@ jobs:
           echo "has_changes=$([ "$code" -eq 2 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
           terraform show -no-color tfplan > plan.txt
 
+      # archive_file zips (Lambda code) are built during plan. A saved plan
+      # never re-reads data sources, so the apply job needs these exact files.
+      - name: bundle build outputs the plan depends on
+        run: |
+          find terraform/modules -path '*/.build/*' -type f -print0 | sort -z \
+            | tar --null --sort=name -czf "$WORKDIR/build-files.tgz" -T -
+          tar -tzf "$WORKDIR/build-files.tgz"
+
       - name: checksum + metadata
         working-directory: ${{ env.WORKDIR }}
         run: |
-          sha256sum tfplan > tfplan.sha256
+          sha256sum tfplan build-files.tgz > tfplan.sha256
           jq -n \
             --arg env "${{ matrix.environment }}" \
             --arg head_sha "$HEAD_SHA" \
@@ -225,6 +233,7 @@ jobs:
             ${{ env.WORKDIR }}/tfplan.sigstore.json
             ${{ env.WORKDIR }}/plan-metadata.json
             ${{ env.WORKDIR }}/plan.txt
+            ${{ env.WORKDIR }}/build-files.tgz
           retention-days: 5
           if-no-files-found: error
 

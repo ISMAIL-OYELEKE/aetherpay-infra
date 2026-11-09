@@ -35,9 +35,9 @@ variable "logs_kms_key_arn" {
 
 # ------------------------------------------------------------------- Aurora
 variable "db_engine_version" {
-  description = "Aurora PostgreSQL engine version."
+  description = "Aurora PostgreSQL major version (e.g. \"16\") or exact version. A major version resolves to the newest minor AWS offers at plan time, because AWS retires old minors."
   type        = string
-  default     = "16.6"
+  default     = "16"
 }
 
 variable "db_name" {

@@ -96,12 +96,20 @@ resource "aws_iam_role_policy_attachment" "monitoring" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"
 }
 
+# AWS retires Aurora minor versions; a hard-coded minor (it was 16.6) stops
+# being creatable. Resolve the newest minor of the requested major instead.
+data "aws_rds_engine_version" "aurora" {
+  engine  = "aurora-postgresql"
+  version = var.db_engine_version
+  latest  = true
+}
+
 resource "aws_rds_cluster" "this" {
   #checkov:skip=CKV2_AWS_8:Continuous backups with 35-day PITR plus Aurora Global replication; AWS Backup is layered on at the account level.
   cluster_identifier        = "${var.name}-settlement"
   engine                    = "aurora-postgresql"
   engine_mode               = "provisioned"
-  engine_version            = var.db_engine_version
+  engine_version            = data.aws_rds_engine_version.aurora.version_actual
   global_cluster_identifier = var.global_cluster_identifier
 
   database_name                       = var.is_secondary_region ? null : var.db_name
