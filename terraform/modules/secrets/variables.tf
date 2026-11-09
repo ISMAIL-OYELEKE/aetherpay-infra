@@ -72,6 +72,12 @@ variable "permissions_boundary_arn" {
   default     = null
 }
 
+variable "rotation_reserved_concurrency" {
+  description = "Reserved concurrency for the rotation Lambda (-1 = none). New AWS accounts often have a total concurrency quota of 10, and AWS refuses any reservation that would leave fewer than 10 unreserved."
+  type        = number
+  default     = -1
+}
+
 variable "log_retention_days" {
   description = "Rotation Lambda log retention."
   type        = number
