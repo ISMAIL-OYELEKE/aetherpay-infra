@@ -10,7 +10,7 @@ on:
     paths: ["app/**", ".github/workflows/app-ci.yml"]
   push:
     branches: [main]
-    paths: ["app/**"]
+    paths: ["app/**", ".github/workflows/app-ci.yml"]
   workflow_dispatch: # build the first image right after bootstrap
 
 permissions:
@@ -43,6 +43,9 @@ jobs:
   image:
     needs: test
     runs-on: ubuntu-latest
+    env:
+      # Publish only outside PRs and once bootstrap has set the repo variables.
+      PUBLISH: ${{ github.event_name != 'pull_request' && vars.AWS_IMAGE_PUSH_ROLE_ARN != '' }}
     permissions:
       contents: read
       id-token: write
@@ -68,8 +71,12 @@ jobs:
           fail-build: true
           output-format: table # findings are printed in the job log
 
+      - name: note when publishing is not configured yet
+        if: github.event_name != 'pull_request' && env.PUBLISH != 'true'
+        run: echo "::notice::Image built and scanned but not pushed. Run terraform/bootstrap and scripts/configure-github.sh to set AWS_IMAGE_PUSH_ROLE_ARN, AWS_REGION and ECR_REPOSITORY_URL."
+
       - name: configure AWS credentials (OIDC, image push role)
-        if: github.event_name != 'pull_request'
+        if: env.PUBLISH == 'true'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_IMAGE_PUSH_ROLE_ARN }}
@@ -77,12 +84,12 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
 
       - name: login to ECR
-        if: github.event_name != 'pull_request'
+        if: env.PUBLISH == 'true'
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: push immutable tag
         id: push
-        if: github.event_name != 'pull_request'
+        if: env.PUBLISH == 'true'
         env:
           REPO: ${{ vars.ECR_REPOSITORY_URL }}
         run: |
@@ -93,14 +100,14 @@ jobs:
           echo "image=$REPO@$digest" >> "$GITHUB_OUTPUT"
 
       - uses: sigstore/cosign-installer@v3
-        if: github.event_name != 'pull_request'
+        if: env.PUBLISH == 'true'
 
       - name: sign image (keyless)
-        if: github.event_name != 'pull_request'
+        if: env.PUBLISH == 'true'
         run: cosign sign --yes "${{ steps.push.outputs.image }}"
 
       - name: promotion instructions
-        if: github.event_name != 'pull_request'
+        if: env.PUBLISH == 'true'
         run: |
           {
             echo "### Image published"
