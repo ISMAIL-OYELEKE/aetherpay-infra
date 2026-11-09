@@ -87,17 +87,30 @@ jobs:
         if: env.PUBLISH == 'true'
         uses: aws-actions/amazon-ecr-login@v2
 
+      # Push with BuildKit itself, not `docker tag` + `docker push`. On the
+      # runner's Docker 29 (containerd image store) a re-push rewrote the
+      # manifest so its layer list no longer matched the config's rootfs, and
+      # Fargate refused to unpack it ("mismatched image rootfs and manifest
+      # layers"). The builder reuses the cache from the build step above, so
+      # this pushes the same layers that were scanned.
       - name: push immutable tag
+        id: build_push
+        if: env.PUBLISH == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          push: true
+          tags: ${{ vars.ECR_REPOSITORY_URL }}:git-${{ github.sha }}
+          provenance: false
+          sbom: false
+
+      - name: image reference
         id: push
         if: env.PUBLISH == 'true'
         env:
           REPO: ${{ vars.ECR_REPOSITORY_URL }}
-        run: |
-          tag="git-${GITHUB_SHA::12}"
-          docker tag aetherpay-app:ci "$REPO:$tag"
-          docker push "$REPO:$tag"
-          digest=$(docker inspect --format='{{index .RepoDigests 0}}' "$REPO:$tag" | cut -d@ -f2)
-          echo "image=$REPO@$digest" >> "$GITHUB_OUTPUT"
+          DIGEST: ${{ steps.build_push.outputs.digest }}
+        run: echo "image=$REPO@$DIGEST" >> "$GITHUB_OUTPUT"
 
       - uses: sigstore/cosign-installer@v3
         if: env.PUBLISH == 'true'
