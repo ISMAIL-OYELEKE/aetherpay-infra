@@ -40,6 +40,7 @@ jobs:
       head_sha: ${{ steps.find.outputs.head_sha }}
       run_id: ${{ steps.find.outputs.run_id }}
       pr: ${{ steps.find.outputs.pr }}
+      skip: ${{ steps.find.outputs.skip }}
     steps:
       - name: find merged PR and its plan run
         id: find
@@ -49,7 +50,13 @@ jobs:
             const { owner, repo } = context.repo;
             const prs = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: context.sha });
             const pr = prs.data.find(p => p.merged_at && p.base.ref === 'main');
-            if (!pr) core.setFailed(`No merged PR for ${context.sha}: direct pushes to main are not applied. Open a PR.`);
+            if (!pr) {
+              // Only reviewed, planned PRs are ever applied. Branch protection should
+              // block direct pushes; if one happens anyway, nothing is applied.
+              core.warning(`No merged PR for ${context.sha}: direct pushes to main are never applied.`);
+              core.setOutput('skip', 'true');
+              return;
+            }
             const runs = await github.rest.actions.listWorkflowRuns({
               owner, repo, workflow_id: 'terraform-ci.yml', event: 'pull_request', head_sha: pr.head.sha, status: 'success',
             });
@@ -61,10 +68,12 @@ jobs:
             core.notice(`Applying plan from PR #${pr.number}, head ${pr.head.sha}, run ${run.id}`);
 
       - uses: actions/checkout@v4
+        if: steps.find.outputs.skip != 'true'
         with:
           fetch-depth: 0
 
       - name: merged Terraform code must equal planned code
+        if: steps.find.outputs.skip != 'true'
         run: |
           if ! git diff --quiet "${{ steps.find.outputs.head_sha }}" "${{ github.sha }}" -- terraform/; then
             echo "::error::terraform/ on main differs from the planned PR head. Update the branch and re-plan."
@@ -75,6 +84,7 @@ jobs:
   apply:
     name: apply (${{ matrix.environment }})
     needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
     runs-on: ubuntu-latest
     strategy:
       max-parallel: 1 # staging first, then production
