@@ -9,6 +9,12 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PORT=8080
+# Pick up Debian security fixes released after the base image was built, and
+# drop pip from the runtime image (it is only needed in the build stage).
+RUN apt-get update \
+ && apt-get upgrade -y --no-install-recommends \
+ && rm -rf /var/lib/apt/lists/* \
+ && python -m pip uninstall -y pip
 RUN groupadd --system --gid 10001 app && useradd --system --uid 10001 --gid app --no-create-home app
 COPY --from=build /install /usr/local
 WORKDIR /srv

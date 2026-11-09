@@ -66,6 +66,7 @@ jobs:
           severity-cutoff: high
           only-fixed: true
           fail-build: true
+          output-format: table # findings are printed in the job log
 
       - name: configure AWS credentials (OIDC, image push role)
         if: github.event_name != 'pull_request'
