@@ -30,7 +30,7 @@ for env in staging production; do
   upper="$(echo "$env" | tr '[:lower:]' '[:upper:]')"
   set_var "AWS_PLAN_ROLE_ARN_${upper}" "$(outj plan_role_arns "$env")"
   set_var "AWS_APPLY_ROLE_ARN_${upper}" "$(outj apply_role_arns "$env")"
-  gh api -X PUT "repos/${REPO}/environments/${env}" >/dev/null && echo "environment ${env} ready (add required reviewers in Settings > Environments)"
+  gh api -X PUT "repos/${REPO}/environments/${env}" >/dev/null && echo "environment ${env} ready"
 done
 
 emails="[]"

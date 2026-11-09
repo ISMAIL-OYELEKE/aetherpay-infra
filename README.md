@@ -78,7 +78,7 @@ flowchart LR
   plan --> comment[PR comment]
   art --> merge[Merge to main]
   merge --> verify["verify code == planned,<br/>checksum, signature"]
-  verify --> gate{"GitHub Environment<br/>approval"}
+  verify --> gate{"human approval<br/>(issue comment)"}
   gate --> apply["terraform apply tfplan<br/>(OIDC, env-bound role)"]
   cron["cron every 6 h"] --> drift["plan -detailed-exitcode"]
   drift -->|"2 drift / 1 error"| alert["Slack + PagerDuty"]
@@ -224,7 +224,7 @@ alarm_emails             = ["oncall@<your-domain>"]
 
 **Secrets:** `SLACK_WEBHOOK_URL` and `PAGERDUTY_ROUTING_KEY` (drift alerts).
 
-**Environments:** create `staging` and `production`, add required reviewers (production at least), and restrict deployment branches to `main`.
+**Environments:** create `staging` and `production`. The apply job always waits for a human: it opens an issue with the plan summary and continues only after an approver (`APPLY_APPROVERS` variable, default the repo owner) comments `approve`. On a GitHub plan that supports it, also add Environment required reviewers and protect `main`.
 
 **Branch protection on `main`:** require PRs, the `terraform-ci` and `app-ci` checks, and "branches up to date before merging" (this keeps the planned code identical to the merged code).
 
@@ -232,7 +232,7 @@ alarm_emails             = ["oncall@<your-domain>"]
 
 1. Run the `app-ci` workflow on `main` (Actions, app-ci, Run workflow). The job summary prints `…/aetherpay/app@sha256:…`.
 2. Open a PR that sets `app_image` in [`terraform/environments/staging/image.auto.tfvars`](terraform/environments/staging/image.auto.tfvars).
-3. Review the plan comment, merge, and approve the `staging` environment. The pipeline applies the signed plan.
+3. Review the plan comment and merge. The apply workflow verifies the signed plan, opens an "Apply to staging" issue, and applies only after you comment `approve` on it.
 
 To work locally instead: `cp backend.hcl.example backend.hcl`, fill it in, run `terraform init -backend-config=backend.hcl`, then `terraform plan -out=tfplan` and `terraform apply tfplan`.
 

@@ -3,11 +3,17 @@
 #   resolve: find the merged PR, its head commit and the terraform-ci run that
 #            planned it; refuse if the merged Terraform code differs from what
 #            was planned.
-#   apply:   per environment (staging, then production), behind a GitHub
-#            Environment with required reviewers. Downloads the plan, verifies
-#            the checksum and the Sigstore signature (must come from this repo's
-#            terraform-ci workflow), then runs `terraform apply tfplan`.
-#            There is no `terraform apply -auto-approve` anywhere.
+#   apply:   per environment (staging, then production). Downloads the plan,
+#            verifies the checksum and the Sigstore signature (must come from
+#            this repo's terraform-ci workflow), then waits for a human
+#            approval before running `terraform apply tfplan`. There is no
+#            `terraform apply -auto-approve` anywhere.
+#
+# Approval gate: an issue is opened with the plan summary and the job waits
+# until an approver (APPLY_APPROVERS repo variable, default: repo owner)
+# comments "approve" (or "deny" to stop). This works on any GitHub plan. On a
+# plan that supports it, GitHub Environment required reviewers can be added
+# on top, since the job already deploys through the matching Environment.
 #
 # A plan made against an older state serial is rejected by Terraform itself
 # ("Saved plan is stale"), so a merge that raced another apply fails safely
@@ -92,7 +98,7 @@ jobs:
         # Environments live in this account. Set the TF_ENVIRONMENTS repo variable
         # to '["staging","production"]' once production is bootstrapped.
         environment: ${{ fromJSON(vars.TF_ENVIRONMENTS || '["staging"]') }}
-    environment: ${{ matrix.environment }} # required reviewers = approval gate
+    environment: ${{ matrix.environment }} # deployment history; reviewers optional
     # Queue (never cancel) per environment; shared with drift detection.
     concurrency:
       group: terraform-state-${{ matrix.environment }}
@@ -101,6 +107,7 @@ jobs:
       contents: read
       actions: read
       id-token: write
+      issues: write # approval issue
     env:
       ENV_UPPER: ${{ matrix.environment == 'staging' && 'STAGING' || 'PRODUCTION' }}
       WORKDIR: terraform/environments/${{ matrix.environment }}
@@ -142,6 +149,29 @@ jobs:
             --bundle tfplan.sigstore.json \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             --certificate-identity-regexp "^https://github.com/${{ github.repository }}/\.github/workflows/terraform-ci\.yml@refs/pull/${{ needs.resolve.outputs.pr }}/merge$"
+
+      - name: summarise plan for the approver
+        id: summary
+        if: steps.meta.outputs.has_changes == 'true'
+        working-directory: ${{ env.WORKDIR }}
+        run: echo "line=$(grep -E '^Plan:' plan.txt | head -1)" >> "$GITHUB_OUTPUT"
+
+      - name: wait for human approval (comment "approve" on the issue)
+        if: steps.meta.outputs.has_changes == 'true'
+        uses: trstringer/manual-approval@v1
+        timeout-minutes: 120
+        with:
+          secret: ${{ github.token }}
+          approvers: ${{ vars.APPLY_APPROVERS || github.repository_owner }}
+          minimum-approvals: 1
+          exclude-workflow-initiator-as-approver: false
+          issue-title: "Apply to ${{ matrix.environment }}: PR #${{ needs.resolve.outputs.pr }}"
+          issue-body: |
+            Verified signed plan from PR #${{ needs.resolve.outputs.pr }} (head `${{ env.HEAD_SHA }}`), terraform-ci run ${{ needs.resolve.outputs.run_id }}.
+
+            **${{ steps.summary.outputs.line }}**
+
+            The full plan is the comment on PR #${{ needs.resolve.outputs.pr }}. Comment `approve` to apply exactly that plan to **${{ matrix.environment }}**, or `deny` to stop.
 
       - uses: hashicorp/setup-terraform@v3
         if: steps.meta.outputs.has_changes == 'true'
