@@ -16,73 +16,23 @@ Production-grade AWS infrastructure for **AetherPay**: a webhook ingestion and s
 
 ### Regional stack
 
-```mermaid
-flowchart LR
-  partner([Payment rails and<br/>custodians]) -->|HTTPS, TLS 1.3 only| waf
-
-  subgraph region["AWS region (3 AZs)"]
-    subgraph vpc["VPC 10.24.0.0/20"]
-      subgraph public["Public tier /26 x3"]
-        waf["WAF<br/>1,000 req / 5 min / IP<br/>managed rule groups"] --> alb[ALB :443]
-        nat["NAT gateway<br/>(opt-in, allow-listed only)"]
-      end
-      subgraph app["Private app tier /22 x3: no public IPs, no default route"]
-        ing["ECS Fargate<br/>ingestor"]
-        set["ECS Fargate<br/>settler"]
-        rot["Lambda<br/>key rotation"]
-      end
-      subgraph iso["Isolated tier /25 x3: no internet, no NAT"]
-        cache[("ElastiCache Valkey<br/>IAM auth, TLS, CMK")]
-        db[("Aurora PostgreSQL<br/>IAM auth, TLS 1.3, CMK")]
-        vpce["Interface endpoints<br/>ECR, Logs, Secrets Manager,<br/>KMS, SQS, STS, X-Ray"]
-      end
-    end
-    sqs[["SQS ingestion queue<br/>+ DLQ (CMK)"]]
-    sm["Secrets Manager<br/>(CMK, auto-rotation)"]
-    ddb[("DynamoDB ledger journal<br/>MRSC global table")]
-  end
-
-  alb -->|:8080| ing
-  ing -->|6379 TLS| cache
-  ing -->|443 via VPCE| sqs
-  ing -->|443 via VPCE| sm
-  set -->|443 via VPCE| sqs
-  set -->|gateway endpoint| ddb
-  set -->|5432 TLS| db
-  rot -->|443 via VPCE| sm
-```
+![Regional stack: AWS Cloud, us-east-1, VPC with public, private app and isolated subnets](docs/diagrams/aetherpay-regional-stack.png)
 
 ### Multi-region (production)
 
-```mermaid
-flowchart TB
-  dns["webhooks.example.com<br/>Route 53 failover records"] --> arc{"Route 53 ARC<br/>routing controls<br/>(5-region data plane)"}
-  arc -->|On| use1["us-east-1: primary<br/>full stack, holds settlement lease"]
-  arc -.->|Off until failover| use2["us-east-2: warm standby<br/>full stack, reduced min capacity"]
-  use1 <-->|"synchronous quorum (2 of 3)"| ledger[("Ledger journal<br/>DynamoDB MRSC")]
-  use2 <-->|"synchronous quorum (2 of 3)"| ledger
-  witness["us-west-2: MRSC witness"] --- ledger
-  use1 -->|"Aurora Global (async, about 1 s)"| use2
-  use1 -->|"Secrets Manager replication<br/>ECR replication"| use2
-```
+![Multi-region DR: us-east-1 primary, us-east-2 warm standby, us-west-2 witness](docs/diagrams/aetherpay-multi-region.png)
 
 The quorum, fencing and failover design (RPO 0 for the ledger, no split brain, no dependence on the failing region's control plane) is explained in [ADR-001](docs/ADR-001-Disaster-Recovery.md).
 
 ### Delivery pipeline
 
-```mermaid
-flowchart LR
-  pr[Pull request] --> lint["fmt + tflint"] & test["validate +<br/>terraform test"] & sec["checkov<br/>(blocking)"]
-  lint & test & sec --> plan["plan per env<br/>(OIDC, read-only role)"]
-  plan --> art["tfplan + sha256 +<br/>Sigstore bundle<br/>(5-day artifact)"]
-  plan --> comment[PR comment]
-  art --> merge[Merge to main]
-  merge --> verify["verify code == planned,<br/>checksum, signature"]
-  verify --> gate{"human approval<br/>(issue comment)"}
-  gate --> apply["terraform apply tfplan<br/>(OIDC, env-bound role)"]
-  cron["cron every 6 h"] --> drift["plan -detailed-exitcode"]
-  drift -->|"2 drift / 1 error"| alert["Slack + PagerDuty"]
-```
+![Delivery pipeline: signed plan, human approval, keyless OIDC](docs/diagrams/aetherpay-delivery-pipeline.png)
+
+---
+
+## Deployment evidence
+
+Staging was deployed end to end to a real AWS account, tested, and destroyed the same day. Screenshots of every stage, including the failures found and fixed along the way, are in [`docs/evidence/`](docs/evidence/README.md).
 
 ---
 
