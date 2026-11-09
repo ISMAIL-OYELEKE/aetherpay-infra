@@ -113,20 +113,30 @@ data "aws_iam_policy_document" "key" {
     }
   }
 
-  # Required by DynamoDB for tables encrypted with a customer managed key:
-  # the service itself (not the caller) reads the key's metadata.
+  # DynamoDB itself (not the caller) uses the key for a global table: it reads
+  # the key's metadata and encrypts/decrypts while replicating. Limited to this
+  # account's resources.
   statement {
-    sid    = "AllowDynamoDbToDescribeKey"
+    sid    = "AllowDynamoDbServiceForThisAccount"
     effect = "Allow"
     actions = [
-      "kms:DescribeKey", "kms:GetKeyPolicy", "kms:GetKeyRotationStatus",
-      "kms:ListAliases", "kms:ListGrants", "kms:ListResourceTags",
+      "kms:CreateGrant", "kms:Decrypt", "kms:DescribeKey", "kms:Encrypt",
+      "kms:GenerateDataKey", "kms:GenerateDataKeyWithoutPlaintext", "kms:GetKeyPolicy",
+      "kms:GetKeyRotationStatus", "kms:ListAliases", "kms:ListGrants", "kms:ListResourceTags",
+      "kms:ReEncryptFrom", "kms:ReEncryptTo",
     ]
     resources = ["*"]
 
     principals {
       type        = "Service"
       identifiers = ["dynamodb.amazonaws.com"]
+    }
+
+    # IfExists: not every DynamoDB call carries the source account.
+    condition {
+      test     = "StringEqualsIfExists"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
     }
   }
 
@@ -151,6 +161,14 @@ data "aws_iam_policy_document" "key" {
       test     = "StringNotEquals"
       variable = "aws:PrincipalArn"
       values   = [local.account_root]
+    }
+
+    # AWS services acting on their own behalf (DynamoDB replication) carry no
+    # kms:ViaService or principal ARN; without this they would be denied too.
+    condition {
+      test     = "Bool"
+      variable = "aws:PrincipalIsAWSService"
+      values   = ["false"]
     }
   }
 }

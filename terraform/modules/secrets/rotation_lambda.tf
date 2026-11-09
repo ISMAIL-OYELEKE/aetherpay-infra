@@ -149,6 +149,7 @@ resource "aws_lambda_function" "rotation" {
   #checkov:skip=CKV_AWS_272:Code is built from this repository and shipped inside the signed, reviewed plan artifact.
   #checkov:skip=CKV_AWS_117:Runs in the VPC (vpc_config below).
   #checkov:skip=CKV_AWS_173:No environment variables are defined.
+  #checkov:skip=CKV_AWS_115:Reservation is configurable (rotation_reserved_concurrency); new accounts cannot reserve any.
   function_name                  = local.function_name
   description                    = "Rotates AetherPay HMAC signing keys"
   role                           = aws_iam_role.rotation.arn
@@ -158,7 +159,7 @@ resource "aws_lambda_function" "rotation" {
   source_code_hash               = data.archive_file.rotation.output_base64sha256
   timeout                        = 30
   memory_size                    = 256
-  reserved_concurrent_executions = 2
+  reserved_concurrent_executions = var.rotation_reserved_concurrency
 
   vpc_config {
     subnet_ids         = var.app_subnet_ids
