@@ -210,6 +210,7 @@ Or set them by hand. **Repository variables** (Settings, Secrets and variables, 
 | `AWS_PLAN_ROLE_ARN_STAGING` / `_PRODUCTION` | from `plan_role_arns` |
 | `AWS_APPLY_ROLE_ARN_STAGING` / `_PRODUCTION` | from `apply_role_arns` |
 | `TFVARS_STAGING` / `TFVARS_PRODUCTION` | account-specific HCL, see below |
+| `TF_ENVIRONMENTS` | optional; environments CI plans, applies and drift-checks. Defaults to `["staging"]`; set `["staging","production"]` once production is configured |
 
 ```hcl
 # TFVARS_STAGING

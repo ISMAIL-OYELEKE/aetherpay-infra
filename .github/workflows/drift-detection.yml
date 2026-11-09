@@ -26,11 +26,15 @@ env:
 jobs:
   drift:
     name: drift (${{ matrix.environment }})
+    # Nothing to compare against until bootstrap has set the repo variables.
+    if: vars.TF_STATE_BUCKET != ''
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        environment: [staging, production]
+        # Environments live in this account. Set the TF_ENVIRONMENTS repo variable
+        # to '["staging","production"]' once production is bootstrapped.
+        environment: ${{ fromJSON(vars.TF_ENVIRONMENTS || '["staging"]') }}
     # Same group as the apply workflow: drift checks wait for an apply to finish.
     concurrency:
       group: terraform-state-${{ matrix.environment }}

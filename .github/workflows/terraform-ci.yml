@@ -138,7 +138,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        environment: [staging, production]
+        # Environments live in this account. Set the TF_ENVIRONMENTS repo variable
+        # to '["staging","production"]' once production is bootstrapped.
+        environment: ${{ fromJSON(vars.TF_ENVIRONMENTS || '["staging"]') }}
     # One plan per environment per PR at a time; the S3 lock file also
     # serialises against applies and drift checks.
     concurrency:

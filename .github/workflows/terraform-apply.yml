@@ -89,7 +89,9 @@ jobs:
     strategy:
       max-parallel: 1 # staging first, then production
       matrix:
-        environment: [staging, production]
+        # Environments live in this account. Set the TF_ENVIRONMENTS repo variable
+        # to '["staging","production"]' once production is bootstrapped.
+        environment: ${{ fromJSON(vars.TF_ENVIRONMENTS || '["staging"]') }}
     environment: ${{ matrix.environment }} # required reviewers = approval gate
     # Queue (never cancel) per environment; shared with drift detection.
     concurrency:
