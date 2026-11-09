@@ -3,4 +3,4 @@
 # Until the first image is built, leave it commented: the plan then fails fast
 # with "No value for required variable", which is intended.
 #
-app_image = "768499314608.dkr.ecr.us-east-1.amazonaws.com/aetherpay/app@sha256:b0c92ba0245325258c31d487d9bfdf9066774dcb4b9ae4205bf8be7217a419f5"
+app_image = "768499314608.dkr.ecr.us-east-1.amazonaws.com/aetherpay/app@sha256:500dcd223c8131f22214340da9d5d631d7c78896e9da17e4503d1541f4d59f91"
