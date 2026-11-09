@@ -226,6 +226,24 @@ jobs:
             -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
             -backend-config="kms_key_id=${{ vars.TF_STATE_KMS_KEY_ARN }}"
 
+      - name: restore build outputs and match them to the signed plan
+        if: steps.meta.outputs.has_changes == 'true'
+        run: |
+          # build-files.tgz is covered by tfplan.sha256 (checked above). Each
+          # Lambda zip must also hash to the source_code_hash in the signed plan.
+          tar -xzf "$WORKDIR/build-files.tgz"
+          terraform -chdir="$WORKDIR" show -json tfplan \
+            | jq -r '.resource_changes[]
+                | select(.type == "aws_lambda_function" and .change.after != null and .change.after.filename != null)
+                | [.change.after.filename, .change.after.source_code_hash] | @tsv' \
+            | while IFS=$'\t' read -r file want; do
+                got=$(openssl dgst -sha256 -binary "$WORKDIR/$file" | base64)
+                if [ "$got" != "$want" ]; then
+                  echo "::error::$file does not match the signed plan"; exit 1
+                fi
+                echo "verified $file"
+              done
+
       - name: apply the exact approved plan
         if: steps.meta.outputs.has_changes == 'true'
         working-directory: ${{ env.WORKDIR }}

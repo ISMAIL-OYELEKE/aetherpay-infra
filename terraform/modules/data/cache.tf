@@ -15,16 +15,23 @@ resource "aws_elasticache_subnet_group" "this" {
   tags        = local.tags
 }
 
-# Valkey requires a "default" user in every user group; this one is locked out.
-resource "aws_elasticache_user" "default_disabled" {
-  user_id       = "${replace(var.name, "_", "-")}-default-off"
-  user_name     = "default"
-  engine        = "valkey"
-  access_string = "off -@all"
+# Every user group needs a "default" user; this one is locked out ("off").
+# Valkey rejects no-password-required users, so it gets a long random
+# password that is generated at apply time, sent to AWS once and never
+# written to the Terraform state (ephemeral + write-only). Nobody knows it,
+# and the user is disabled anyway.
+ephemeral "random_password" "cache_default_user" {
+  length  = 64
+  special = false
+}
 
-  authentication_mode {
-    type = "no-password-required"
-  }
+resource "aws_elasticache_user" "default_disabled" {
+  user_id              = "${replace(var.name, "_", "-")}-default-off"
+  user_name            = "default"
+  engine               = "valkey"
+  access_string        = "off -@all"
+  passwords_wo         = ephemeral.random_password.cache_default_user.result
+  passwords_wo_version = 1
 
   tags = local.tags
 }

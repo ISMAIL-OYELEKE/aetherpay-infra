@@ -37,10 +37,17 @@ module "ledger" {
   key_admin_arns   = var.key_admin_arns
 }
 
+# Same lookup as modules/data, so the global cluster and its members agree.
+data "aws_rds_engine_version" "aurora" {
+  engine  = "aurora-postgresql"
+  version = "16"
+  latest  = true
+}
+
 resource "aws_rds_global_cluster" "settlement" {
   global_cluster_identifier = "${local.name}-settlement"
   engine                    = "aurora-postgresql"
-  engine_version            = "16.6"
+  engine_version            = data.aws_rds_engine_version.aurora.version_actual
   storage_encrypted         = true
   deletion_protection       = true
 }

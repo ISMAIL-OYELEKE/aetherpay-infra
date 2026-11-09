@@ -113,6 +113,23 @@ data "aws_iam_policy_document" "key" {
     }
   }
 
+  # Required by DynamoDB for tables encrypted with a customer managed key:
+  # the service itself (not the caller) reads the key's metadata.
+  statement {
+    sid    = "AllowDynamoDbToDescribeKey"
+    effect = "Allow"
+    actions = [
+      "kms:DescribeKey", "kms:GetKeyPolicy", "kms:GetKeyRotationStatus",
+      "kms:ListAliases", "kms:ListGrants", "kms:ListResourceTags",
+    ]
+    resources = ["*"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["dynamodb.amazonaws.com"]
+    }
+  }
+
   statement {
     sid       = "DenyUseOutsideDynamoDb"
     effect    = "Deny"
