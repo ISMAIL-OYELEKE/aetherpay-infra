@@ -15,6 +15,12 @@
 # plan that supports it, GitHub Environment required reviewers can be added
 # on top, since the job already deploys through the matching Environment.
 #
+# Re-running an apply: "Re-run jobs" replays the original workflow file, so
+# after a workflow fix use Actions > terraform-apply > Run workflow with the
+# merged PR number. The same checks apply: the PR must be merged into main,
+# main's terraform/ must still equal what was planned, and the plan must carry
+# a valid terraform-ci signature.
+#
 # A plan made against an older state serial is rejected by Terraform itself
 # ("Saved plan is stale"), so a merge that raced another apply fails safely
 # and must be re-planned.
@@ -26,6 +32,12 @@ on:
     branches: [main]
     paths:
       - "terraform/**"
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Merged PR number whose signed plan should be applied"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -54,8 +66,23 @@ jobs:
         with:
           script: |
             const { owner, repo } = context.repo;
-            const prs = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: context.sha });
-            const pr = prs.data.find(p => p.merged_at && p.base.ref === 'main');
+            let pr;
+            if (context.eventName === 'workflow_dispatch') {
+              if (context.ref !== 'refs/heads/main') {
+                core.setFailed('Run this workflow from main.');
+                return;
+              }
+              const n = Number(context.payload.inputs.pr);
+              const { data } = await github.rest.pulls.get({ owner, repo, pull_number: n });
+              if (!data.merged_at || data.base.ref !== 'main') {
+                core.setFailed(`PR #${n} is not merged into main.`);
+                return;
+              }
+              pr = data;
+            } else {
+              const prs = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: context.sha });
+              pr = prs.data.find(p => p.merged_at && p.base.ref === 'main');
+            }
             if (!pr) {
               // Only reviewed, planned PRs are ever applied. Branch protection should
               // block direct pushes; if one happens anyway, nothing is applied.
@@ -81,6 +108,9 @@ jobs:
       - name: merged Terraform code must equal planned code
         if: steps.find.outputs.skip != 'true'
         run: |
+          # The PR branch is usually deleted on merge (and squashed away), so
+          # fetch the planned commit through GitHub's permanent PR ref.
+          git fetch --no-tags origin "refs/pull/${{ steps.find.outputs.pr }}/head"
           if ! git diff --quiet "${{ steps.find.outputs.head_sha }}" "${{ github.sha }}" -- terraform/; then
             echo "::error::terraform/ on main differs from the planned PR head. Update the branch and re-plan."
             git diff --stat "${{ steps.find.outputs.head_sha }}" "${{ github.sha }}" -- terraform/
