@@ -1,0 +1,20 @@
+# Checkov configuration. Inline `#checkov:skip` comments document resource-level
+# exceptions next to the code. The checks below are skipped globally because
+# they are false positives for this layout or not applicable:
+#
+#   CKV2_AWS_5   SG attachment is not traced across module boundaries.
+#   CKV2_AWS_23  Alias records point at ALBs passed in as variables.
+#   CKV2_AWS_76  The Log4j AMR (KnownBadInputs) is present in the web ACL, but the
+#                ACL is associated from a different module than it is defined in.
+#   CKV2_AWS_62  S3 event notifications are not required for state/log buckets.
+#   CKV_AWS_144  Cross-region replication is not used for log/state buckets.
+framework:
+  - terraform
+compact: true
+quiet: true
+skip-check:
+  - CKV2_AWS_5
+  - CKV2_AWS_23
+  - CKV2_AWS_76
+  - CKV2_AWS_62
+  - CKV_AWS_144
