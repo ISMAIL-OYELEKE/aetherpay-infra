@@ -188,10 +188,12 @@ To work locally instead: `cp backend.hcl.example backend.hcl`, fill it in, run `
 
 ### Cost and teardown (staging)
 
-Staging is sized small (1 Aurora Serverless v2 instance at 0.5-2 ACU, 2 x `cache.t4g.micro`, 3 Fargate tasks, 9 interface endpoints x 3 AZs, ALB, WAF) and has deletion protection off. Expect roughly USD 10-20 per running day. Tear down with:
+Staging is sized small (1 Aurora Serverless v2 instance at 0.5-2 ACU, 2 x `cache.t4g.micro`, 3 Fargate tasks, 9 interface endpoints x 3 AZs, ALB, WAF) and has deletion protection off. Expect roughly USD 10-20 per running day. The required inputs (ECR repository, permissions boundary and so on) live in the `TFVARS_STAGING` repository variable, which CI writes to `ci.auto.tfvars`, so a local destroy needs them too. After `terraform init` against the remote state, tear down with:
 
 ```bash
-terraform -chdir=terraform/environments/staging destroy
+gh variable get TFVARS_STAGING > /tmp/staging.tfvars
+terraform -chdir=terraform/environments/staging destroy -var-file=/tmp/staging.tfvars
+rm /tmp/staging.tfvars
 ```
 
 Production adds a second region, an ARC cluster and larger capacity; do not deploy it to a personal account.
