@@ -176,7 +176,7 @@ alarm_emails             = ["oncall@<your-domain>"]
 
 **Environments:** create `staging` and `production`. The apply job always waits for a human: it opens an issue with the plan summary and continues only after an approver (`APPLY_APPROVERS` variable, default the repo owner) comments `approve`. On a GitHub plan that supports it, also add Environment required reviewers and protect `main`.
 
-**Branch protection on `main`:** require PRs, the `terraform-ci` and `app-ci` checks, and "branches up to date before merging" (this keeps the planned code identical to the merged code).
+**Branch protection on `main`:** require PRs, the `terraform-ci` and `app-ci` checks, and "branches up to date before merging" (this keeps the planned code identical to the merged code). Branch protection on a private repository needs GitHub Pro or Team; on the free plan, the apply job's checksum and signature checks still guarantee that what is applied is exactly what was planned.
 
 ### 3. Ship the first image and deploy staging
 
