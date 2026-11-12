@@ -1,101 +1,79 @@
 # ADR-001: Multi-Region Resiliency and Disaster Recovery
 
-- **Status:** Accepted
-- **Scope:** Production. Primary `us-east-1`, secondary `us-east-2`, ledger witness and ARC config in `us-west-2`
-- **Code:** `modules/ledger`, `modules/dr-routing`, `environments/production`
+**Status:** Accepted · **Scope:** production (`us-east-1` primary, `us-east-2` secondary, `us-west-2` ledger witness and ARC) · **Code:** `modules/ledger`, `modules/dr-routing`, `environments/production`
 
-## Context
+## Context and decision
 
-At 02:15 UTC the primary region suffers a control-plane outage (networking and storage APIs) with a partially degraded data plane: about 40% packet loss. It is an **asymmetric partition**: the region is not dead, so health checks flap, while partner webhooks time out and payment networks start auto-suspending us. The dangerous failure is not the outage itself. It is that the degraded primary keeps (or later resumes) settling transactions after we fail over, which causes **split-brain writes and double settlement**.
+At 02:15 UTC the primary region loses its networking and storage control planes and drops about 40% of packets: degraded, not dead. The real danger is a degraded primary that keeps, or later resumes, settling after failover, causing **split-brain writes and double settlement**. Decision: the ledger journal is a **DynamoDB global table with Multi-Region Strong Consistency (MRSC)** (replicas in `us-east-1`/`us-east-2`, witness in `us-west-2`; a write is acknowledged only when durable in 2 of 3 regions); settlement has **one writer, enforced by a fencing epoch**; everything else is **warm standby** in `us-east-2`; traffic moves with **Route 53 ARC routing controls**.
 
-## Decision
+## RPO and RTO
 
-1. **The ledger journal is the system of record and is synchronously replicated.** It is a DynamoDB global table with **Multi-Region Strong Consistency (MRSC)**: two full replicas (`us-east-1`, `us-east-2`) plus a witness (`us-west-2`). A write is acknowledged only once it is durable in 2 of the 3 regions.
-2. **Settlement has exactly one active writer**, enforced by a monotonic **fencing epoch** stored in that same quorum table. Storage is active-active; settlement authority is active-passive.
-3. **Everything else is warm standby.** The secondary runs the full stack at reduced capacity: Aurora Global secondary, replicated signing secrets and container images.
-4. **Traffic moves with Route 53 ARC routing controls**, flipped through ARC's multi-region data plane. Failover never calls a control-plane API in the failing region.
-
-## RPO and RTO targets
-
-| Data / capability | RPO | RTO | How it is achieved |
+| Data | RPO | RTO | How |
 |---|---|---|---|
-| Immutable ledger journal | **0** | ≤ 15 min (writes never stop in the healthy majority) | MRSC quorum acknowledgement. An acknowledged entry exists in at least 2 regions. |
-| Settlement batch workspace (Aurora) | ≤ 1 s replication lag; financially **0** | ≤ 15 min | Aurora Global failover. Any lost tail is replayed from the journal stream, because Aurora is a projection, not the source of truth. |
-| Verified-but-unsettled events (SQS) | 0 for anything acknowledged to a partner as settled; in-flight events are re-delivered | ≤ 15 min | Partners retry until they get `202`, which is sent only after a durable enqueue. Events stranded in the primary queue are processed after recovery and de-duplicated by the ledger. |
-| Webhook de-duplication cache | Not preserved (rebuilt) | ≤ 5 min (cache already warm in secondary) | Duplicates are harmless because ledger writes are idempotent (below). |
-| Session state | Not preserved | ≤ 5 min | Clients re-authenticate. |
+| Ledger journal (immutable) | **0** | ≤ 15 min | Quorum acknowledgement: every acknowledged entry exists in 2 regions |
+| Settlement workspace (Aurora) | ≤ 1 s lag, financially 0 | ≤ 15 min | Aurora Global failover; any lost tail is replayed from the journal |
+| Unsettled events (SQS) | 0 once acknowledged | ≤ 15 min | `202` only after a durable enqueue; partners retry; the ledger de-duplicates |
+| Webhook de-duplication cache, sessions | Not preserved | ≤ 5 min | Rebuilt; duplicates are harmless because ledger writes are idempotent |
 
 ## Active-passive vs active-active for the ledger
 
-| | Active-passive (Aurora Global Database) | Active-active (DynamoDB MRSC) **chosen for the journal** |
+| | Active-passive (Aurora Global) | Active-active (DynamoDB MRSC), **chosen** |
 |---|---|---|
-| Replication | Asynchronous storage replication, single writer | Synchronous quorum (2 of 3 regions) |
-| RPO | ~1 s typical; unplanned failover uses `--allow-data-loss` | 0 |
-| Split-brain risk | Old writer can accept writes until fenced; needs external fencing | A partitioned minority **cannot reach quorum, so its writes fail** instead of diverging |
-| Write latency | Local | Cross-region round trip (tens of ms), acceptable for settlement |
-| Constraints | Full SQL, transactions | Single-item conditional writes; no multi-item transactions on MRSC tables (we design around them) |
+| Replication and RPO | Async, single writer; ~1 s, unplanned failover needs `--allow-data-loss` | Synchronous 2-of-3 quorum; 0 |
+| Split brain | Old writer accepts writes until externally fenced | A partitioned minority cannot reach quorum, so its writes fail |
+| Cost | Local write latency, full SQL | Cross-region round trip; single-item conditional writes only |
 
-Aurora stays as the relational settlement workspace (batching, reporting), where a sub-second RPO is acceptable because it can be rebuilt from the journal.
+Aurora stays as the batching and reporting workspace; sub-second RPO is fine there because it is rebuilt from the journal.
 
-## Fencing and quorum: preventing split brain and double settlement
+## Fencing and quorum
 
-**Quorum.** Every journal write goes to the MRSC table. During the partition, a primary losing 40% of packets either reaches the quorum (then its write is linearizable and visible everywhere) or it does not (then the write fails). There is no third outcome where two regions accept conflicting versions.
-
-**Idempotency at the row.** Each settlement is written as `pk = TXN#<settlement_id>` with `ConditionExpression: attribute_not_exists(pk)`. The `settlement_id` is the payment rail's own idempotency key. A second attempt to write the same settlement, from any region and at any time, fails with `ConditionalCheckFailedException`. This alone makes **double-recording impossible**.
-
-**Fencing epoch for side effects.** Submitting a batch to a payment network is an external side effect that the database cannot undo, so it needs a single authority:
-
-1. The lease item `pk = FENCE#settlement` holds `{epoch, holder_region, expires_at}`. A settler acquires or renews it with a conditional `UpdateItem` (`SET epoch = epoch + 1, holder = :me ...` when expired or already held by `:me`). The IAM policy only lets settlers update `FENCE#*` and `BATCH#*` keys (`dynamodb:LeadingKeys`).
-2. A batch is claimed with `PutItem BATCH#<batch_id>` (`attribute_not_exists`) carrying the claimant's epoch. Immediately before the external call, the worker does a strongly consistent read of the lease and aborts unless `epoch == mine`.
-3. **Self-fencing.** A holder stops all settlement work when the remaining lease time drops below a safety margin (lease 30 s, renew every 10 s, stop at under 10 s, measured on a monotonic clock). A degraded primary that cannot reach the quorum cannot renew, so it fences itself before the secondary can take over.
-4. The batch ID is passed to the payment network as its idempotency key, which closes the last read-then-act window.
-
-**The degraded primary recovers mid-failover with transactions still in memory.** Its epoch is `N`; the secondary now holds `N+1`.
-- Journal writes for settlements the secondary already recorded fail the `attribute_not_exists` check and are dropped.
-- New, never-seen events may be journaled, which is correct because they are real, verified events. They cannot be *settled* by the old holder: its lease check fails (`N ≠ N+1`) and it cannot renew because `holder ≠ :me`.
-- Unacknowledged SQS messages in the primary return to the queue after the visibility timeout. They are processed by whichever region holds the lease once the primary is healthy, and de-duplicated by the journal.
+- **Quorum.** A primary losing packets either reaches 2 of 3 regions (the write is linearizable everywhere) or the write fails. Two regions can never accept conflicting versions.
+- **Idempotent rows.** Each settlement is `pk = TXN#<settlement_id>` written with `attribute_not_exists(pk)`, where the ID is the rail's idempotency key. A second write from any region fails, so double-recording is impossible.
+- **Fencing epoch for external side effects.** The lease item `FENCE#settlement` holds `{epoch, holder_region, expires_at}` and is taken by a conditional update that increments the epoch. A batch is claimed with `PutItem BATCH#<id>` carrying the epoch; right before calling the payment network the worker re-reads the lease (strongly consistent) and aborts unless the epoch is still its own. The batch ID is the network's idempotency key. IAM restricts settlers to `FENCE#*`/`BATCH#*` keys (`dynamodb:LeadingKeys`).
+- **Self-fencing.** 30 s lease, renewed every loop; the holder stops settling when under 10 s remain. A primary that cannot reach quorum cannot renew, so it fences itself before the secondary takes over.
+- **Primary recovers mid-failover with work in memory.** It holds epoch `N`, the secondary `N+1`. Already-recorded settlements fail the condition check; new events may be journaled but not settled (lease check fails); unacknowledged SQS messages return to the queue and are settled once by the lease holder.
 
 ## Control plane vs data plane
 
-The failover path uses only data-plane operations, or control planes in healthy regions:
-
-| Need | Mechanism | Why it survives a `us-east-1` control-plane outage |
-|---|---|---|
-| Move partner traffic | ARC `UpdateRoutingControlStates` against any of the **5 regional cluster endpoints** (3 needed) | ARC's data plane is independent of Route 53's control plane (`ChangeResourceRecordSets`). DNS answers and health checks come from Route 53's global data plane. |
-| Credentials | Pre-provisioned break-glass roles; `aws sts assume-role --region us-east-2` (regional STS) | The IAM control plane lives in `us-east-1`, so **no IAM changes are made during the incident**. The IAM Identity Center home region is outside `us-east-1`. |
-| Compute in secondary | Already running (warm standby). Scaling calls go to `us-east-2` APIs. | Nothing has to be created in the failing region. |
-| Secrets | Secrets Manager replicas in `us-east-2`, encrypted with a `us-east-2` CMK | Read locally; rotation pauses until the primary returns, and the overlap window covers it. |
-| Images | ECR cross-region replication | Pulled from the `us-east-2` registry through local VPC endpoints. |
-| Ledger | MRSC | No failover action at all; the healthy majority keeps writing. |
-| Aurora | `failover-global-cluster` called on the **`us-east-2`** endpoint | Executed by the target region. |
-| Terraform | **Not used during the incident** | State lives in `us-east-1`; infrastructure changes are frozen until recovery. |
+Failover uses only data planes or healthy-region control planes. **Traffic:** ARC `UpdateRoutingControlStates` on any of 5 regional cluster endpoints; DNS answers come from Route 53's global data plane, not `ChangeResourceRecordSets`. **Credentials:** pre-provisioned break-glass roles through regional STS in `us-east-2`; no IAM changes during the incident (IAM's control plane is in `us-east-1`). **Compute, secrets, images:** already running in `us-east-2`, with Secrets Manager replicas under a local CMK and ECR replication. **Ledger:** no action; the healthy majority keeps writing. **Aurora:** `failover-global-cluster` is called on the `us-east-2` endpoint. **Terraform:** frozen, because state lives in `us-east-1`.
 
 ## Runbook: first 30 minutes
 
-Pre-reqs kept offline in the incident vault: ARC cluster endpoints and routing-control ARNs (`terraform output arc_cluster_endpoints`), and break-glass role ARNs.
+From the offline incident vault the operator exports `ARC_EP` (try the next endpoint on failure), `RC_PRIMARY`, `RC_SECONDARY` (`terraform output arc_cluster_endpoints`) and `T=aetherpay-prod-ledger-journal`. Each `# gate:` must pass before the next step.
 
 ```bash
-export ARC_EP=https://<id>.route53-recovery-cluster.us-west-2.amazonaws.com/v1   # try the next endpoint on failure
-export RC_PRIMARY=arn:aws:route53-recovery-control::<acct>:controlpanel/<cp>/routingcontrol/<primary>
-export RC_SECONDARY=arn:aws:route53-recovery-control::<acct>:controlpanel/<cp>/routingcontrol/<secondary>
-export T=aetherpay-prod-ledger-journal
+# T+0  SEV1 page; name incident commander, comms and operator; disable the terraform-apply workflow
+# T+3  probe both regions + AWS Health Dashboard
+for h in use1 use2; do curl -s -o /dev/null -w "$h %{http_code} %{time_total}s\n" https://$h.webhooks.example.com/healthz; done
+#      gate: fail over if primary errors > 5% or p99 > 3 s for 5 min (do not wait for a full outage)
+# T+6  credentials from the healthy region
+aws sts assume-role --region us-east-2 --role-arn <breakglass> --role-session-name sev1    # gate: get-caller-identity works
+# T+8  secondary readiness
+aws ecs describe-services --region us-east-2 --cluster aetherpay-prod-use2 --services aetherpay-prod-use2-ingestor aetherpay-prod-use2-settler
+aws dynamodb describe-table --region us-east-2 --table-name $T --query 'Table.Replicas'   # gate: tasks healthy, replica ACTIVE, /healthz 200
+# T+10 pre-scale to primary capacity (settler: --min-capacity 3)
+aws application-autoscaling register-scalable-target --region us-east-2 --service-namespace ecs --scalable-dimension ecs:service:DesiredCount \
+  --resource-id service/aetherpay-prod-use2/aetherpay-prod-use2-ingestor --min-capacity 6 --max-capacity 60
+# T+13 FENCE the primary: the epoch increments, so the old holder can no longer settle (best effort: scale the use1 settler to 0)
+aws dynamodb update-item --region us-east-2 --table-name $T --return-values ALL_NEW \
+  --key '{"pk":{"S":"FENCE#settlement"},"sk":{"S":"LEASE"}}' \
+  --update-expression 'SET epoch = epoch + :one, holder_region = :h, expires_at = :exp' --condition-expression 'holder_region <> :h' \
+  --expression-attribute-values '{":one":{"N":"1"},":h":{"S":"us-east-2"},":exp":{"N":"'$(( $(date +%s) + 30 ))'"}}'
+#      gate: holder_region = us-east-2 with the new epoch; primary settlers log "lease lost, fencing" or are unreachable
+# T+15 SHIFT TRAFFIC in one ARC call (the safety rule keeps at least one region On)
+aws route53-recovery-cluster update-routing-control-states --region us-west-2 --endpoint-url $ARC_EP \
+  --update-routing-control-state-entries RoutingControlArn=$RC_SECONDARY,RoutingControlState=On RoutingControlArn=$RC_PRIMARY,RoutingControlState=Off
+#      gate: get-routing-control-state on the primary is Off; dig returns use2 ALB addresses within 60 s
+# T+20 promote Aurora, then start the journal-to-Aurora replay        gate: writer is use2, replay lag 0
+aws rds failover-global-cluster --region us-east-2 --global-cluster-identifier aetherpay-prod-settlement \
+  --target-db-cluster-identifier <use2-cluster-arn> --allow-data-loss
+# T+25 signed synthetic webhook, then read it back
+aws dynamodb get-item --region us-east-2 --table-name $T --consistent-read --key '{"pk":{"S":"TXN#synthetic-<id>"},"sk":{"S":"ENTRY#0"}}'
+#      gate: 202, row present, queue age falling, DLQ empty, 5xx alarm OK
+# T+30 ask payment networks to lift suspensions; status page; 30-min updates
+#      failback only after 2 h healthy, as a planned switchover, lease handover and ARC flip
 ```
-
-| Time | Action | Verification gate |
-|---|---|---|
-| **T+0** | PagerDuty SEV1 (ALB 5xx alarm, partner timeout alarm). Incident commander, comms lead and operator assigned; deploys frozen (disable the `terraform-apply` workflow). | Bridge open, roles named. |
-| **T+3** | Confirm it is regional and not us: run external probes against both regional hostnames.<br>`for h in use1 use2; do curl -s -o /dev/null -w "$h %{http_code} %{time_total}s\n" https://$h.webhooks.example.com/healthz; done`<br>Check the AWS Health Dashboard for `us-east-1`. | **Fail over if** the primary error rate is over 5% or p99 is over 3 s for 5 min, or partners report timeouts. Do not wait for a full outage; a partial partition is the trigger. |
-| **T+6** | Get credentials in the healthy region:<br>`aws sts assume-role --region us-east-2 --role-arn <breakglass> --role-session-name sev1` | `aws sts get-caller-identity --region us-east-2` succeeds. |
-| **T+8** | Check secondary readiness:<br>`aws ecs describe-services --region us-east-2 --cluster aetherpay-prod-use2 --services aetherpay-prod-use2-ingestor aetherpay-prod-use2-settler --query 'services[].{s:serviceName,run:runningCount,want:desiredCount}'`<br>`aws dynamodb describe-table --region us-east-2 --table-name $T --query 'Table.Replicas[].{r:RegionName,s:ReplicaStatus}'` | Tasks healthy; ledger replica `ACTIVE`; `use2` `/healthz` returns 200. |
-| **T+10** | Pre-scale the secondary to primary capacity:<br>`aws application-autoscaling register-scalable-target --region us-east-2 --service-namespace ecs --scalable-dimension ecs:service:DesiredCount --resource-id service/aetherpay-prod-use2/aetherpay-prod-use2-ingestor --min-capacity 6 --max-capacity 60` (repeat for the settler with `--min-capacity 3`) | `runningCount` reaches the new minimum. |
-| **T+13** | **Fence the primary**: take the settlement lease for `us-east-2` (the epoch increments):<br>`aws dynamodb update-item --region us-east-2 --table-name $T --key '{"pk":{"S":"FENCE#settlement"},"sk":{"S":"LEASE"}}' --update-expression 'SET epoch = epoch + :one, holder_region = :h, expires_at = :exp' --condition-expression 'holder_region <> :h' --expression-attribute-values '{":one":{"N":"1"},":h":{"S":"us-east-2"},":exp":{"N":"'$(( $(date +%s) + 30 ))'"}}' --return-values ALL_NEW`<br>Best effort only: `aws ecs update-service --region us-east-1 --cluster aetherpay-prod-use1 --service aetherpay-prod-use1-settler --desired-count 0` | `ALL_NEW` shows `holder_region = us-east-2` and the new epoch. Primary settlers log `lease lost, fencing` (or are unreachable, which is equally safe). |
-| **T+15** | **Shift traffic** (one atomic call; the safety rule keeps at least one region On):<br>`aws route53-recovery-cluster update-routing-control-states --region us-west-2 --endpoint-url $ARC_EP --update-routing-control-state-entries RoutingControlArn=$RC_SECONDARY,RoutingControlState=On RoutingControlArn=$RC_PRIMARY,RoutingControlState=Off` | `aws route53-recovery-cluster get-routing-control-state --region us-west-2 --endpoint-url $ARC_EP --routing-control-arn $RC_PRIMARY` returns `Off`; `dig +short webhooks.example.com @1.1.1.1` returns `use2` ALB addresses within 60 s (record TTL). |
-| **T+20** | Promote Aurora in the secondary:<br>`aws rds failover-global-cluster --region us-east-2 --global-cluster-identifier aetherpay-prod-settlement --target-db-cluster-identifier arn:aws:rds:us-east-2:<acct>:cluster:aetherpay-prod-use2-settlement --allow-data-loss`<br>Then start the journal-to-Aurora replay from the last projection checkpoint. | `aws rds describe-global-clusters --region us-east-2 --query 'GlobalClusters[0].GlobalClusterMembers[?IsWriter].DBClusterArn'` shows `use2`; replay lag drops to 0. |
-| **T+25** | End-to-end check: send a signed synthetic webhook to `https://webhooks.example.com/webhooks/synthetic`, then read it back:<br>`aws dynamodb get-item --region us-east-2 --table-name $T --consistent-read --key '{"pk":{"S":"TXN#synthetic-<id>"},"sk":{"S":"ENTRY#0"}}'` | `202` returned; journal row present; SQS `ApproximateAgeOfOldestMessage` falling; DLQ empty; ALB 5xx alarm `OK`. |
-| **T+30** | Ask payment networks to lift suspensions; post a status-page update; hand partners the replay window (they retry automatically). Schedule 30-minute updates. Record the timeline. | Partner acknowledgements logged. **No failback** until the primary has been healthy for 2 h; failback is a planned Aurora *switchover* (no data loss), a lease handover and an ARC flip, run as a normal change. |
 
 ## Consequences
 
-- **Positive.** Zero ledger loss, no split-brain by construction (quorum plus idempotency plus fencing), and failover depends on no `us-east-1` control plane.
-- **Negative.** Higher write latency on the journal, no multi-item transactions on MRSC tables, an ARC cluster that costs money (production only), and warm-standby capacity paid for in `us-east-2`.
-- **Follow-ups.** Replicate the Terraform state bucket to `us-east-2`; run a quarterly game day that injects packet loss (AWS FIS `aws:network:disrupt-connectivity`) against the primary; automate T+8 to T+15 as an ARC Region switch plan, keeping a human approval step.
+Zero ledger loss and no split brain by construction, with no dependency on the `us-east-1` control plane. The costs are higher journal write latency, no multi-item transactions on MRSC tables, the ARC cluster and paid warm standby. Follow-ups: replicate the state bucket to `us-east-2`, run quarterly packet-loss game days with AWS FIS, and automate T+8 to T+15 as an ARC Region switch plan with human approval.
