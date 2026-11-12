@@ -123,7 +123,7 @@ make security     # checkov (0 failed; exceptions are justified inline)
 make app          # ruff + pytest for the ingestor and settler
 ```
 
-Current results: 12 Terraform tests pass, `validate` is clean, `tflint` reports nothing, Checkov reports 2,114 passed and 0 failed, and 21 app tests pass.
+Current results: 12 Terraform tests pass, `validate` is clean, `tflint` reports nothing, Checkov reports 2,108 passed and 0 failed, and 23 app tests pass.
 
 ---
 
