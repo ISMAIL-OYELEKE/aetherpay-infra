@@ -81,6 +81,7 @@ resource "aws_ecs_task_definition" "this" {
   memory                   = var.memory
   execution_role_arn       = aws_iam_role.execution.arn
   task_role_arn            = var.task_role_arn
+  enable_fault_injection   = false
 
   runtime_platform {
     operating_system_family = "LINUX"
@@ -98,11 +99,16 @@ resource "aws_ecs_task_definition" "this" {
         privileged             = false
         stopTimeout            = 30
 
+        # Written the way ECS stores them, so a no-op plan stays empty
+        # instead of re-registering the task definition every run.
+        systemControls = []
+        volumesFrom    = []
+
         environment = [for k in sort(keys(var.environment)) : { name = k, value = var.environment[k] }]
 
         linuxParameters = {
           initProcessEnabled = true
-          capabilities       = { drop = ["ALL"] }
+          capabilities       = { add = [], drop = ["ALL"] }
         }
 
         mountPoints = [{ sourceVolume = "tmp", containerPath = "/tmp", readOnly = false }]
@@ -121,7 +127,7 @@ resource "aws_ecs_task_definition" "this" {
       # jsondecode(jsonencode()) keeps both branches type-compatible.
       jsondecode(var.command == null ? "{}" : jsonencode({ command = var.command })),
       jsondecode(!local.has_listener ? "{}" : jsonencode({
-        portMappings = [{ containerPort = var.container_port, protocol = "tcp" }]
+        portMappings = [{ containerPort = var.container_port, hostPort = var.container_port, protocol = "tcp" }]
         healthCheck = {
           command     = ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:${var.container_port}${var.health_check_path}', timeout=3).status == 200 else 1)"]
           interval    = 15
@@ -134,7 +140,8 @@ resource "aws_ecs_task_definition" "this" {
   ])
 
   volume {
-    name = "tmp"
+    name                = "tmp"
+    configure_at_launch = false
   }
 
   tags = local.tags
