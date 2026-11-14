@@ -63,6 +63,10 @@ module "primary" {
   domain_name    = "use1.${var.global_domain_name}"
   hosted_zone_id = var.hosted_zone_id
 
+  # Partners dial the global name; ARC answers with this ALB, so its cert must
+  # cover that name too. The primary owns the shared validation record.
+  certificate_sans = [var.global_domain_name]
+
   app_image          = var.app_image_primary
   create_repository  = false
   ecr_repository_arn = var.ecr_repository_arn
@@ -82,6 +86,7 @@ module "primary" {
     max_acu                   = 64
     instance_count            = 3
     global_cluster_identifier = aws_rds_global_cluster.settlement.id
+    is_global_member          = true
   }
 
   cache = {
@@ -119,6 +124,9 @@ module "secondary" {
   domain_name    = "use2.${var.global_domain_name}"
   hosted_zone_id = var.hosted_zone_id
 
+  certificate_sans              = [var.global_domain_name]
+  create_san_validation_records = false # the primary owns that record
+
   app_image          = var.app_image_secondary
   create_repository  = false
   ecr_repository_arn = local.secondary_ecr_repository_arn
@@ -140,6 +148,7 @@ module "secondary" {
     # so the secondary cluster attaches in the right order without depends_on.
     global_cluster_identifier = module.primary.db_global_cluster_identifier
     is_secondary_region       = true
+    is_global_member          = true
   }
 
   cache = {

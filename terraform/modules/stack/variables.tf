@@ -48,6 +48,18 @@ variable "domain_name" {
   type        = string
 }
 
+variable "certificate_sans" {
+  description = "Extra certificate names, e.g. the global hostname that ARC routes to this region."
+  type        = list(string)
+  default     = []
+}
+
+variable "create_san_validation_records" {
+  description = "Own the DNS validation records for certificate_sans (true in exactly one region)."
+  type        = bool
+  default     = true
+}
+
 variable "hosted_zone_id" {
   description = "Route 53 zone for certificate validation and alias records."
   type        = string
@@ -149,6 +161,9 @@ variable "db" {
     instance_count            = optional(number, 2)
     global_cluster_identifier = optional(string)
     is_secondary_region       = optional(bool, false)
+    # Static flag (the identifier is often unknown until apply) that selects
+    # the Aurora Global credential path instead of the RDS-managed secret.
+    is_global_member = optional(bool, false)
   })
   default = {}
 }

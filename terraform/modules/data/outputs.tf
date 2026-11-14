@@ -24,8 +24,8 @@ output "db_name" {
 }
 
 output "db_master_secret_arn" {
-  description = "ARN of the RDS-managed master secret (break-glass only). The value is never exposed."
-  value       = try(aws_rds_cluster.this.master_user_secret[0].secret_arn, null)
+  description = "ARN of the master credential secret (break-glass only). The value is never exposed."
+  value       = try(aws_rds_cluster.this.master_user_secret[0].secret_arn, aws_secretsmanager_secret.db_master[0].arn, null)
 }
 
 output "cache_primary_endpoint" {
@@ -51,4 +51,9 @@ output "cache_user_arn" {
 output "cache_user_name" {
   description = "ElastiCache IAM user name."
   value       = aws_elasticache_user.workload.user_name
+}
+
+output "db_master_credential_mode" {
+  description = "How the master credential is provisioned: rds-managed (standalone), write-only-secret (global primary) or none (global secondary)."
+  value       = local.is_standalone ? "rds-managed" : (local.is_global_primary ? "write-only-secret" : "none")
 }

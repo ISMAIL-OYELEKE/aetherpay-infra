@@ -73,3 +73,18 @@ output "alarm_topic_arn" {
   description = "SNS topic for operational alarms."
   value       = aws_sns_topic.alarms.arn
 }
+
+output "certificate_names" {
+  description = "Names on this region's ALB certificate."
+  value       = module.edge.certificate_names
+}
+
+output "certificate_validation_record_names" {
+  description = "Certificate names whose DNS validation record this region owns."
+  value       = module.edge.validation_record_names
+}
+
+output "db_master_credential_mode" {
+  description = "How this region's Aurora master credential is provisioned."
+  value       = module.data.db_master_credential_mode
+}

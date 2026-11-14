@@ -54,8 +54,8 @@ net=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
   --query 'services[0].networkConfiguration' --output json)
 started=$(($(date +%s) * 1000))
 script="import os,time; from aetherpay.keys import SigningKeyProvider; from aetherpay import signature; \
-k=SigningKeyProvider(os.environ['PARTNER_HMAC_KEY_ARN']).keys()[0]; t=int(time.time()); \
-print('SMOKE_SIGNATURE', t, signature.sign(k, t, os.environ['SMOKE_BODY'].encode()), flush=True)"
+k=SigningKeyProvider(os.environ['PARTNER_HMAC_KEY_ARN']).keys()[0]; t=int(time.time()); e=f'evt-smoke-{t}'; \
+print('SMOKE_SIGNATURE', t, e, signature.sign(k, t, os.environ['SMOKE_BODY'].encode(), partner='acme', event_id=e), flush=True)"
 overrides=$(printf '{"containerOverrides":[{"name":"app","command":["python","-c",%s],"environment":[{"name":"SMOKE_BODY","value":%s}]}]}' \
   "$(printf '%s' "$script" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')" \
   "$(printf '%s' "$BODY" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')")
@@ -70,9 +70,9 @@ for _ in 1 2 3 4 5 6; do
   [ -n "$line" ] && [ "$line" != "None" ] && break
   sleep 5
 done
-read -r _ sts sig <<<"$line"
+# The partner (acme) and event id are part of the signed string.
+read -r _ sts evt sig <<<"$line"
 [ -n "${sig:-}" ] || { echo "could not read the signature from $LOG_GROUP"; exit 1; }
-evt="evt-smoke-$sts"
 for attempt in first replay; do
   printf '%s: ' "$attempt"
   curl -s -w '  -> HTTP %{http_code}\n' -X POST "$URL/webhooks/acme" \

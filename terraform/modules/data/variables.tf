@@ -24,7 +24,7 @@ variable "data_kms_key_arn" {
 }
 
 variable "secrets_kms_key_arn" {
-  description = "CMK for the RDS-managed master credential secret."
+  description = "CMK for the database master credential secret."
   type        = string
 }
 
@@ -80,6 +80,24 @@ variable "global_cluster_identifier" {
   description = "Join an Aurora Global Database. Null for a standalone cluster."
   type        = string
   default     = null
+}
+
+variable "is_global_member" {
+  description = "True when the cluster joins an Aurora Global Database. Static, because global_cluster_identifier is often unknown at plan time."
+  type        = bool
+  default     = false
+}
+
+variable "db_master_password_version" {
+  description = "Bump to rotate the Aurora Global master password (write-only; the value never enters state)."
+  type        = number
+  default     = 1
+}
+
+variable "db_secret_replica_regions" {
+  description = "Replicate the Aurora Global master secret: region => CMK ARN in that region."
+  type        = map(string)
+  default     = {}
 }
 
 variable "is_secondary_region" {

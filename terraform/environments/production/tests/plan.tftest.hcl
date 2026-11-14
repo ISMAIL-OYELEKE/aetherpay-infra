@@ -70,4 +70,31 @@ run "production_plans_both_regions" {
     condition     = output.global_webhook_url == "https://webhooks.example.com/webhooks/"
     error_message = "Global webhook URL is wrong."
   }
+
+  # Partners verify TLS against the global name, so both regional ALB
+  # certificates must carry it, and only the primary owns its DNS record.
+  assert {
+    condition = alltrue([
+      contains(module.primary.certificate_names, "webhooks.example.com"),
+      contains(module.secondary.certificate_names, "webhooks.example.com"),
+    ])
+    error_message = "Both regional certificates must cover the global hostname."
+  }
+
+  assert {
+    condition = (
+      contains(module.primary.certificate_validation_record_names, "webhooks.example.com") &&
+      !contains(module.secondary.certificate_validation_record_names, "webhooks.example.com")
+    )
+    error_message = "Exactly one region must own the shared SAN validation record."
+  }
+
+  # RDS-managed master passwords are unsupported on Aurora Global clusters.
+  assert {
+    condition = (
+      module.primary.db_master_credential_mode == "write-only-secret" &&
+      module.secondary.db_master_credential_mode == "none"
+    )
+    error_message = "Global clusters must not use manage_master_user_password; the primary needs its own write-only master secret."
+  }
 }

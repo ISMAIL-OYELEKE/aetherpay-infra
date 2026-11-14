@@ -10,6 +10,16 @@ locals {
   validation = local.create_cert ? {
     for o in aws_acm_certificate.this[0].domain_validation_options : o.domain_name => o
   } : {}
+
+  # Every name on the certificate, e.g. the regional probe name plus the global
+  # partner-facing name that ARC points at this ALB. TLS clients verify the
+  # hostname they dialled, so the global name must be on each regional cert.
+  cert_names = concat([var.domain_name], var.subject_alternative_names)
+
+  # ACM uses the same validation CNAME for a name in every region of an account.
+  # Only one stack may own the record for a shared SAN, or a destroy in one
+  # region would delete the other region's validation record.
+  validation_record_names = var.create_san_validation_records ? local.cert_names : [var.domain_name]
 }
 
 check "certificate_source" {
@@ -23,10 +33,11 @@ check "certificate_source" {
 resource "aws_acm_certificate" "this" {
   count = local.create_cert ? 1 : 0
 
-  domain_name       = var.domain_name
-  validation_method = "DNS"
-  key_algorithm     = "EC_prime256v1"
-  tags              = local.tags
+  domain_name               = var.domain_name
+  subject_alternative_names = var.subject_alternative_names
+  validation_method         = "DNS"
+  key_algorithm             = "EC_prime256v1"
+  tags                      = local.tags
 
   lifecycle {
     create_before_destroy = true
@@ -35,7 +46,7 @@ resource "aws_acm_certificate" "this" {
 
 resource "aws_route53_record" "validation" {
   # Keyed by the static domain name so the plan never depends on apply-time values.
-  for_each = local.create_cert ? toset([var.domain_name]) : toset([])
+  for_each = local.create_cert ? toset(local.validation_record_names) : toset([])
 
   zone_id         = var.hosted_zone_id
   name            = local.validation[each.key].resource_record_name
@@ -48,8 +59,12 @@ resource "aws_route53_record" "validation" {
 resource "aws_acm_certificate_validation" "this" {
   count = local.create_cert ? 1 : 0
 
-  certificate_arn         = aws_acm_certificate.this[0].arn
-  validation_record_fqdns = [for r in aws_route53_record.validation : r.fqdn]
+  certificate_arn = aws_acm_certificate.this[0].arn
+  # Built from ACM's own validation names so a SAN whose record is owned by the
+  # other region's stack is still waited for.
+  validation_record_fqdns = [for n in local.cert_names : trimsuffix(local.validation[n].resource_record_name, ".")]
+
+  depends_on = [aws_route53_record.validation]
 }
 
 # ------------------------------------------------------------------------ ALB

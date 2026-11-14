@@ -281,9 +281,29 @@ data "aws_iam_policy_document" "settler" {
   }
 
   statement {
-    sid       = "AppendJournalEntries"
-    actions   = ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:Query"]
+    sid       = "ReadLedger"
+    actions   = ["dynamodb:GetItem", "dynamodb:Query"]
     resources = [var.ledger_table_arn]
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceVpce"
+      values   = [var.vpce_ids.dynamodb]
+    }
+  }
+
+  statement {
+    # New journal rows and batch claims only. The settler always sends
+    # attribute_not_exists(pk); IAM cannot force that condition (see ledger).
+    sid       = "AppendJournalEntriesAndBatchClaims"
+    actions   = ["dynamodb:PutItem"]
+    resources = [var.ledger_table_arn]
+
+    condition {
+      test     = "ForAllValues:StringLike"
+      variable = "dynamodb:LeadingKeys"
+      values   = ["TXN#*", "BATCH#*"]
+    }
 
     condition {
       test     = "StringEquals"
