@@ -104,6 +104,59 @@ data "aws_rds_engine_version" "aurora" {
   latest  = true
 }
 
+# ------------------------------------------------- master credential
+# RDS-managed master passwords (manage_master_user_password) are not supported
+# for Aurora Global Database clusters. A global primary therefore gets its own
+# Secrets Manager secret under the secrets CMK instead:
+#   * the password is generated at apply time (ephemeral) and sent to RDS and
+#     Secrets Manager through write-only arguments, so it never enters state;
+#   * it is rotated by bumping var.db_master_password_version, which sends a
+#     new value to both in the same apply;
+#   * it is replicated to the secondary region so break-glass works after a
+#     regional failover. Workloads never use it: they use IAM database auth.
+# A standalone cluster (staging) keeps the RDS-managed secret.
+locals {
+  is_global_primary = var.is_global_member && !var.is_secondary_region
+  is_standalone     = !var.is_global_member
+}
+
+ephemeral "random_password" "db_master" {
+  count = local.is_global_primary ? 1 : 0
+
+  length           = 40
+  override_special = "!#$%^&*()-_=+[]{}<>:?" # RDS rejects / @ " and space
+}
+
+resource "aws_secretsmanager_secret" "db_master" {
+  #checkov:skip=CKV2_AWS_57:Managed rotation is unavailable for Aurora Global master users; rotated by bumping db_master_password_version (write-only, never in state).
+  count = local.is_global_primary ? 1 : 0
+
+  name        = "${var.name}-db-master"
+  description = "Aurora Global master credential (break-glass only; workloads use IAM auth)."
+  kms_key_id  = var.secrets_kms_key_arn
+
+  dynamic "replica" {
+    for_each = var.db_secret_replica_regions
+    content {
+      region     = replica.key
+      kms_key_id = replica.value
+    }
+  }
+
+  tags = local.tags
+}
+
+resource "aws_secretsmanager_secret_version" "db_master" {
+  count = local.is_global_primary ? 1 : 0
+
+  secret_id = aws_secretsmanager_secret.db_master[0].id
+  secret_string_wo = jsonencode({
+    username = "aetherpay_admin"
+    password = ephemeral.random_password.db_master[0].result
+  })
+  secret_string_wo_version = var.db_master_password_version
+}
+
 resource "aws_rds_cluster" "this" {
   #checkov:skip=CKV2_AWS_8:Continuous backups with 35-day PITR plus Aurora Global replication; AWS Backup is layered on at the account level.
   cluster_identifier        = "${var.name}-settlement"
@@ -114,8 +167,10 @@ resource "aws_rds_cluster" "this" {
 
   database_name                       = var.is_secondary_region ? null : var.db_name
   master_username                     = var.is_secondary_region ? null : "aetherpay_admin"
-  manage_master_user_password         = var.is_secondary_region ? null : true
-  master_user_secret_kms_key_id       = var.is_secondary_region ? null : var.secrets_kms_key_arn
+  manage_master_user_password         = local.is_standalone ? true : null
+  master_user_secret_kms_key_id       = local.is_standalone ? var.secrets_kms_key_arn : null
+  master_password_wo                  = local.is_global_primary ? ephemeral.random_password.db_master[0].result : null
+  master_password_wo_version          = local.is_global_primary ? var.db_master_password_version : null
   iam_database_authentication_enabled = true
 
   db_subnet_group_name            = aws_db_subnet_group.this.name

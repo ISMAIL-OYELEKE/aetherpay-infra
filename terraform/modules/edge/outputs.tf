@@ -32,3 +32,13 @@ output "webhook_url" {
   description = "Public webhook base URL."
   value       = "https://${var.domain_name}/webhooks/"
 }
+
+output "certificate_names" {
+  description = "Names on the ALB certificate (regional name first, then SANs). Empty when an existing certificate_arn is used."
+  value       = local.create_cert ? local.cert_names : []
+}
+
+output "validation_record_names" {
+  description = "Certificate names whose DNS validation record this stack owns."
+  value       = local.create_cert ? local.validation_record_names : []
+}

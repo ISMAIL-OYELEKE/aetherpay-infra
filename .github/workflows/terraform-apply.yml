@@ -133,6 +133,9 @@ jobs:
     concurrency:
       group: terraform-state-${{ matrix.environment }}
       cancel-in-progress: false
+      # Without this GitHub keeps only one pending run per group and replaces it
+      # with the next one, so a waiting apply could be dropped. max keeps them all.
+      queue: max
     permissions:
       contents: read
       actions: read

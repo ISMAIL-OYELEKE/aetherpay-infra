@@ -113,3 +113,32 @@ run "ingestor_cannot_touch_ledger_and_settler_cannot_read_partner_key" {
     error_message = "The ledger is append-only; DeleteItem must never be granted."
   }
 }
+
+run "ledger_writes_limited_by_key_prefix" {
+  command = plan
+
+  # Every PutItem/UpdateItem grant must be scoped to item key prefixes, and
+  # journal rows (TXN#) may be created with PutItem but never updated.
+  assert {
+    condition = alltrue([
+      for st in jsondecode(output.settler_policy_json).Statement :
+      can(st.Condition["ForAllValues:StringLike"]["dynamodb:LeadingKeys"])
+      if length(setintersection(toset(flatten([st.Action])), toset(["dynamodb:PutItem", "dynamodb:UpdateItem"]))) > 0
+    ])
+    error_message = "Ledger write grants must carry a dynamodb:LeadingKeys condition."
+  }
+
+  assert {
+    condition = alltrue([
+      for st in jsondecode(output.settler_policy_json).Statement :
+      !contains(flatten([st.Condition["ForAllValues:StringLike"]["dynamodb:LeadingKeys"]]), "TXN#*")
+      if contains(flatten([st.Action]), "dynamodb:UpdateItem")
+    ])
+    error_message = "Journal rows (TXN#) must never be updatable."
+  }
+
+  assert {
+    condition     = !strcontains(output.settler_policy_json, "dynamodb:BatchWriteItem")
+    error_message = "BatchWriteItem would bypass the per-item conditions; never grant it."
+  }
+}

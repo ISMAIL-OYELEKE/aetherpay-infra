@@ -1,18 +1,26 @@
 #!/usr/bin/env bash
 # Sends a drift / plan-error alert to Slack (incoming webhook) and PagerDuty
 # (Events API v2). Inputs come from environment variables set by the
-# drift-detection workflow. Missing destinations are skipped, never fatal.
-set -euo pipefail
+# drift-detection workflow.
+#
+# Each destination is tried independently: a failed Slack call never stops the
+# PagerDuty call. The script exits non-zero if any configured destination
+# failed, or if none is configured while REQUIRE_ALERT_DESTINATION=true (set
+# that repo variable for any environment that is actually deployed).
+set -uo pipefail
 
 : "${STATUS:?}" "${EXIT_CODE:?}" "${ENVIRONMENT:?}" "${RUN_URL:?}"
 DRIFT_FILE="${DRIFT_FILE:-}"
+STAGE="${STAGE:-plan}"
+failures=0
+sent=0
 
 if [[ "$STATUS" == "drift" ]]; then
   title="Terraform drift detected in ${ENVIRONMENT}"
   severity="warning"
   [[ "$ENVIRONMENT" == "production" ]] && severity="error"
 else
-  title="Terraform drift check FAILED to run in ${ENVIRONMENT} (exit ${EXIT_CODE})"
+  title="Terraform drift check FAILED in ${ENVIRONMENT} at ${STAGE} (exit ${EXIT_CODE})"
   severity="critical"
 fi
 
@@ -35,8 +43,8 @@ if [[ -n "${SLACK_WEBHOOK_URL:-}" ]]; then
       { type: "context", elements: [ { type: "mrkdwn",
           text: "Someone changed infrastructure outside Terraform, or the plan could not run. Reconcile via a PR; do not apply from a laptop." } ] }
     ]
-  }' | curl -fsS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL" >/dev/null
-  echo "Slack alert sent"
+  }' | curl -fsS --max-time 15 --retry 2 -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL" >/dev/null
+  if [[ $? -eq 0 ]]; then echo "Slack alert sent"; sent=$((sent + 1)); else echo "::error::Slack alert failed"; failures=$((failures + 1)); fi
 else
   echo "SLACK_WEBHOOK_URL not set; skipping Slack"
 fi
@@ -57,8 +65,16 @@ if [[ -n "${PAGERDUTY_ROUTING_KEY:-}" ]]; then
       custom_details: { changes: $changes, run: $url }
     },
     links: [ { href: $url, text: "Drift run" } ]
-  }' | curl -fsS -X POST -H 'Content-Type: application/json' --data @- https://events.pagerduty.com/v2/enqueue >/dev/null
-  echo "PagerDuty event sent"
+  }' | curl -fsS --max-time 15 --retry 2 -X POST -H 'Content-Type: application/json' --data @- https://events.pagerduty.com/v2/enqueue >/dev/null
+  if [[ $? -eq 0 ]]; then echo "PagerDuty event sent"; sent=$((sent + 1)); else echo "::error::PagerDuty event failed"; failures=$((failures + 1)); fi
 else
   echo "PAGERDUTY_ROUTING_KEY not set; skipping PagerDuty"
+fi
+
+if (( failures > 0 )); then
+  exit 1
+fi
+if (( sent == 0 )) && [[ "${REQUIRE_ALERT_DESTINATION:-false}" == "true" ]]; then
+  echo "::error::No alert destination configured for ${ENVIRONMENT}; set SLACK_WEBHOOK_URL or PAGERDUTY_ROUTING_KEY"
+  exit 1
 fi

@@ -40,6 +40,18 @@ variable "domain_name" {
   type        = string
 }
 
+variable "subject_alternative_names" {
+  description = "Extra names on the ALB certificate, e.g. the global partner-facing hostname that DNS failover points at this region."
+  type        = list(string)
+  default     = []
+}
+
+variable "create_san_validation_records" {
+  description = "Create the DNS validation records for subject_alternative_names. Set false in all but one region when regions share a SAN."
+  type        = bool
+  default     = true
+}
+
 variable "hosted_zone_id" {
   description = "Route 53 public hosted zone used for DNS validation and the alias record. Null when certificate_arn is supplied."
   type        = string

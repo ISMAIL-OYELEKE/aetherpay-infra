@@ -90,6 +90,8 @@ module "data" {
   db_instance_count         = var.db.instance_count
   global_cluster_identifier = var.db.global_cluster_identifier
   is_secondary_region       = var.db.is_secondary_region
+  is_global_member          = var.db.is_global_member
+  db_secret_replica_regions = var.secret_replica_regions
   cache_node_type           = var.cache.node_type
   cache_replicas            = var.cache.replicas
   deletion_protection       = var.deletion_protection
@@ -145,8 +147,11 @@ module "edge" {
   domain_name           = var.domain_name
   hosted_zone_id        = var.hosted_zone_id
   certificate_arn       = var.certificate_arn
-  deletion_protection   = var.deletion_protection
-  tags                  = local.tags
+
+  subject_alternative_names     = var.certificate_sans
+  create_san_validation_records = var.create_san_validation_records
+  deletion_protection           = var.deletion_protection
+  tags                          = local.tags
 }
 
 # ----------------------------------------------------------------- alarms

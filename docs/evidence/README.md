@@ -27,9 +27,9 @@ Screenshots from the staging deployment on 9 November 2026: from an empty AWS ac
 | ![Replication not authorized](09-replication-not-authorized.png) | **The settler crashed on its first write** because the ledger table's append-only policy also denied the DynamoDB replication role. Fixed by exempting that one service role. |
 | ![Healthy](10-services-healthy-200.png) | **Healthy.** Ingestor 2/2, settler 1/1, both ledger replicas `ACTIVE`, `/healthz` returns 200. |
 | ![Smoke test](11-smoke-test-pass.png) | **Smoke test.** TLS 1.2 refused, bad signature 401, signed webhook 202, replay 200 `duplicate`, and the WAF answering 429 after the 1,000-request burst. |
-| ![Journal appended](12-ledger-journal-appended.png) | **End to end.** The settler appended the smoke-test settlement to the multi-region ledger journal. |
+| ![Journal appended](12-ledger-journal-appended.png) | **Webhook to journal.** The settler appended the smoke-test event to the multi-region ledger journal (a journal append, not a completed payment). |
 | ![Self-fencing loop](15-settler-self-fencing-loop.png) | **A subtle bug found in the logs.** A 20 s SQS long poll left exactly the 10 s lease safety margin, so the settler fenced itself on every loop. |
-| ![Lease handover](16-settler-lease-handover.png) | **The fix rolling out.** The old task keeps fencing itself and then stops; the new task, which renews the lease every loop, takes over cleanly. |
+| ![Lease handover](16-settler-lease-handover.png) | **The fix rolling out.** The old task keeps fencing itself and then stops; the new task, which renews the lease every loop, takes over cleanly. This is a same-region rollout, not a multi-region takeover. |
 
 ## 4. Console views
 

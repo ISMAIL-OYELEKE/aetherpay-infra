@@ -274,23 +274,60 @@ resource "aws_dynamodb_table" "journal" {
   tags = local.tags
 }
 
-# The journal is append-only: nobody, including administrators, may delete or
-# overwrite entries through the data plane.
+# What storage enforces, for everyone except DynamoDB's replication role
+# (which must apply every change from the other replica, or AWS marks the
+# replica REPLICATION_NOT_AUTHORIZED and archives it after seven days):
+#   * no DeleteItem and no BatchWriteItem on any row;
+#   * no UpdateItem on journal rows (TXN#*).
+# What it cannot enforce: DynamoDB has no IAM condition that forces a
+# ConditionExpression, so a principal allowed to PutItem a TXN# key could
+# replace a row by omitting attribute_not_exists(pk). Only the settler role
+# may PutItem journal keys (workload-iam, dynamodb:LeadingKeys), and it always
+# sends that condition. The trusted append boundary is therefore the settler
+# code plus IAM, not storage. Administrator-proof immutability would need an
+# external copy such as Streams -> S3 Object Lock (see ADR-001, proposed).
+# The same policy is attached to both replicas.
 data "aws_iam_policy_document" "journal" {
+  for_each = {
+    primary = aws_dynamodb_table.journal.arn
+    replica = local.replica_table_arn
+  }
+
   statement {
-    sid       = "AppendOnlyJournal"
+    sid       = "NoDeletesOrBatchWrites"
     effect    = "Deny"
-    actions   = ["dynamodb:DeleteItem"]
-    resources = [aws_dynamodb_table.journal.arn]
+    actions   = ["dynamodb:DeleteItem", "dynamodb:BatchWriteItem"]
+    resources = [each.value]
 
     principals {
       type        = "AWS"
       identifiers = ["*"]
     }
 
-    # DynamoDB's replication role must be able to apply every change from the
-    # other replica, deletes included. If this deny catches it, AWS marks the
-    # replica REPLICATION_NOT_AUTHORIZED and archives it after seven days.
+    condition {
+      test     = "StringNotEquals"
+      variable = "aws:PrincipalArn"
+      values   = [local.replication_role_arn]
+    }
+  }
+
+  statement {
+    sid       = "NoUpdatesToJournalRows"
+    effect    = "Deny"
+    actions   = ["dynamodb:UpdateItem"]
+    resources = [each.value]
+
+    principals {
+      type        = "AWS"
+      identifiers = ["*"]
+    }
+
+    condition {
+      test     = "ForAnyValue:StringLike"
+      variable = "dynamodb:LeadingKeys"
+      values   = ["TXN#*"]
+    }
+
     condition {
       test     = "StringNotEquals"
       variable = "aws:PrincipalArn"
@@ -299,9 +336,22 @@ data "aws_iam_policy_document" "journal" {
   }
 }
 
+locals {
+  replica_table_arn = "arn:aws:dynamodb:${var.replica_region}:${data.aws_caller_identity.current.account_id}:table/${aws_dynamodb_table.journal.name}"
+}
+
 resource "aws_dynamodb_resource_policy" "journal" {
   resource_arn = aws_dynamodb_table.journal.arn
-  policy       = data.aws_iam_policy_document.journal.json
+  policy       = data.aws_iam_policy_document.journal["primary"].json
+}
+
+resource "aws_dynamodb_resource_policy" "journal_replica" {
+  provider = aws.replica
+
+  resource_arn = local.replica_table_arn
+  policy       = data.aws_iam_policy_document.journal["replica"].json
+
+  depends_on = [aws_dynamodb_table.journal] # the replica exists only once the table has replicated
 }
 
 output "table_name" {
@@ -316,7 +366,7 @@ output "table_arn" {
 
 output "replica_table_arn" {
   description = "Ledger journal table ARN in the replica region."
-  value       = "arn:aws:dynamodb:${var.replica_region}:${data.aws_caller_identity.current.account_id}:table/${aws_dynamodb_table.journal.name}"
+  value       = local.replica_table_arn
 }
 
 output "stream_arn" {

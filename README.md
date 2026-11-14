@@ -22,7 +22,7 @@ Production-grade AWS infrastructure for **AetherPay**: a webhook ingestion and s
 
 ![Multi-region DR: us-east-1 primary, us-east-2 warm standby, us-west-2 witness](docs/diagrams/aetherpay-multi-region.png)
 
-The quorum, fencing and failover design (RPO 0 for the ledger, no split brain, no dependence on the failing region's control plane) is explained in [ADR-001](docs/ADR-001-Disaster-Recovery.md).
+The quorum, fencing and failover design (RPO 0 for committed ledger rows, one settling region at a time, no dependence on the failing region's control plane) is explained in [ADR-001](docs/ADR-001-Disaster-Recovery.md).
 
 ### Delivery pipeline
 
@@ -69,14 +69,14 @@ The production secondary region uses `10.24.16.0/20` with the same layout, so th
 | Containerised compute | ECS Fargate (`modules/compute`, `modules/ecs-service`): read-only root filesystem, non-root user, all capabilities dropped, digest-pinned images |
 | Autoscaling on CPU/memory AND queue depth, asymmetric stabilisation | `modules/ecs-service/autoscaling.tf`: CPU, memory and ALB request target tracking; **SQS backlog-per-task** (metric math `visible / running tasks`) plus a step burst policy on oldest-message age. Scale-out cooldown 30-60 s, scale-in 600-900 s. The DLQ alarms but never scales. |
 | Remote state, encryption, native locking | `terraform/bootstrap`: S3 + SSE-KMS (CMK, bucket key), versioning, TLS-only and wrong-key-denying bucket policy, `use_lockfile = true` (S3 native locking, no DynamoDB) |
-| Secrets in Secrets Manager with CMK and automated rotation; none in code, state or env | `modules/secrets`: CMK-encrypted secrets with a 30-day rotation Lambda. **No secret version is ever written by Terraform**, so values never touch state. Aurora uses `manage_master_user_password` (RDS-rotated, CMK). Workloads use **IAM auth** for Aurora and Valkey, so no app passwords exist. Env vars carry ARNs only, and `ecs-service` rejects secret-looking variable names at plan time. |
+| Secrets in Secrets Manager with CMK and automated rotation; none in code, state or env | `modules/secrets`: CMK-encrypted secrets with a 30-day rotation Lambda. **No secret version is ever written by Terraform**, so values never touch state. Standalone Aurora (staging) uses `manage_master_user_password` (RDS-rotated, CMK). AWS does not support that for Aurora Global, so production generates the master password at apply time and writes it to RDS and its own CMK secret through write-only arguments: never in state, rotated by bumping `db_master_password_version`. Workloads use **IAM auth** for Aurora and Valkey, so no app passwords exist. Env vars carry ARNs only, and `ecs-service` rejects secret-looking variable names at plan time. |
 | Least-privilege roles bound to workload identities | `modules/workload-iam`: one task role per service (the ECS equivalent of IRSA/Pod Identity) with a confused-deputy-safe trust policy; execution roles separate; permissions boundary on every role |
-| No wildcards on storage/KMS/secrets; condition keys tying access to the VPC endpoint or workload | Exact ARNs everywhere; `aws:SourceVpce` on every Secrets Manager, SQS and DynamoDB statement; `kms:ViaService` + `kms:EncryptionContext:SecretARN` on KMS; `dynamodb:LeadingKeys` limits updates to fence and batch items; secret resource policies deny reads outside the endpoint or without the `aetherpay:workload` principal tag. Asserted by [`tests/iam.tftest.hcl`](terraform/modules/workload-iam/tests/iam.tftest.hcl). |
+| No wildcards on storage/KMS/secrets; condition keys tying access to the VPC endpoint or workload | Exact ARNs everywhere; `aws:SourceVpce` on every Secrets Manager, SQS and DynamoDB statement; `kms:ViaService` + `kms:EncryptionContext:SecretARN` on KMS; `dynamodb:LeadingKeys` limits `PutItem` to journal and batch keys and `UpdateItem` to fence and batch keys, and the table policy on both replicas denies deletes, batch writes and updates to journal rows; secret resource policies deny reads outside the endpoint or without the `aetherpay:workload` principal tag. Asserted by [`tests/iam.tftest.hcl`](terraform/modules/workload-iam/tests/iam.tftest.hcl). Exceptions: the DynamoDB gateway endpoint policy allows `dynamodb:*` on this account's tables, and the S3/KMS endpoint layers and the workload boundary use wildcard resources; the identity policies above are what scope access. |
 | Keyless CI | GitHub OIDC; plan roles trust `pull_request` / `main`; apply roles trust only `environment:<env>` |
 | Static analysis that blocks | `terraform fmt`, `validate`, `terraform test`, `tflint` (AWS ruleset), `checkov` (`soft_fail: false`, SARIF report kept as a build artifact) |
 | Immutable plan artifact | Plan on PR, PR comment, `tfplan` + SHA-256 + Sigstore keyless signature, 5-day retention; apply verifies all three plus "merged code == planned code", then runs `terraform apply tfplan` |
-| Concurrency and state protection | `terraform-state-<env>` concurrency group shared by apply and drift (queue, never cancel), plus the S3 lock file with `-lock-timeout` |
-| Scheduled drift detection | `drift-detection.yml`: `-detailed-exitcode` with 0/1/2 handled separately; Slack Block Kit and PagerDuty Events v2 alerts |
+| Concurrency and state protection | `terraform-state-<env>` concurrency group shared by apply and drift with `queue: max` (every run waits its turn, none is cancelled or replaced), plus the S3 lock file with `-lock-timeout` |
+| Scheduled drift detection | `drift-detection.yml`: `-detailed-exitcode` with 0/1/2 handled separately; credential, tfvars and init failures alert too; Slack Block Kit and PagerDuty Events v2 alerts sent independently, and `REQUIRE_ALERT_DESTINATION=true` fails the run if neither is configured. No destination was connected in this demo, and the schedule is disabled while nothing is deployed |
 
 ---
 
@@ -107,6 +107,29 @@ docs/                     ADR-001, vulnerability audit
 scripts/                  drift-alert.sh (Slack / PagerDuty), configure-github.sh (CI setup)
 ```
 
+## What is implemented, tested, deployed or proposed
+
+| Claim | Status |
+|---|---|
+| Network, edge, ECS, autoscaling, secrets, IAM, remote state (staging) | Implemented, mocked-plan tested, **deployed** to staging on 9 Nov 2026 and destroyed the same day |
+| TLS 1.2 refused at the ALB, WAF 429, signed webhook 202, replay reported as duplicate | Deployed and smoke-tested (the evidence curl could not force TLS 1.3, so only the refusal of 1.2 is shown) |
+| Production: second region, MRSC ledger with witness, ARC, Aurora Global, global certificate | Implemented and mocked-plan tested; **never deployed** (cost) |
+| Webhook commit point (202 only after SQS), signature binding partner and event ID, payload-conflict 409 | Implemented and unit-tested (crash between enqueue and marker, cache outage, replay under a new identity) |
+| Lease authority transfer, secondary takeover, old primary kept out, latency-safe lease timing | Implemented and unit-tested against the ADR command's exact expressions; the lease screenshot in the evidence is a same-region rollout, not a multi-region takeover |
+| Journal append-only | Settler code plus IAM and table policy (see ADR-001); not administrator-proof |
+| Payment submission, batch reconciliation, journal-to-Aurora projector, MRSC acceptance before 202 | **Proposed** (reference workload scope); see ADR-001 |
+| Drift alerts to Slack / PagerDuty | Implemented; no real destination was ever connected |
+
+## Known limits
+
+- **CI trust (GitHub free plan).** Environment required reviewers and branch protection are unavailable on this private repo, so the issue-comment gate is enforced by the workflow, not by AWS: a repository writer who adds another workflow naming the environment could assume the apply role without it. The signed plan proves what is applied, not that every route to the role was approved. With a paid plan the apply role would trust only the protected environment with required reviewers and a branch restriction. The workload permissions boundary applies to workload roles, not to the apply role.
+- **Plan role writes state.** The bootstrap gives the plan and apply roles the same `GetObject`/`PutObject`/`DeleteObject` on `<env>/*`. The fix is to give the plan role `GetObject` on the state key and `Get/Put/DeleteObject` on the `.tflock` key only, and to drop `DeleteObject` from apply. It is a bootstrap change, applied from an admin terminal, and was not made before submission.
+- **Accepted-but-unjournaled events are regional** (SQS). See the RPO table in ADR-001.
+- **One partner signing key.** All partner paths share the HMAC key. Partner and event ID are inside the signature, but a key holder could sign for another partner path; per-partner keys would close that.
+- **Signing-key rotation** assumes a partner portal distributes the new key (`setSecret` is a no-op); AWSPREVIOUS stays valid for the overlap window.
+- **Plan artifact.** Only `tfplan` is signed; metadata and the rendered plan are checked by hash, not covered by one signed manifest. Production after staging relies on matrix `max-parallel: 1` rather than an explicit job dependency.
+- **Supply chain.** Actions are pinned to major versions and image signatures are not verified at promotion; the image scan ignores vulnerabilities with no fix available.
+
 ---
 
 ## Local validation (no AWS account needed)
@@ -123,7 +146,7 @@ make security     # checkov (0 failed; exceptions are justified inline)
 make app          # ruff + pytest for the ingestor and settler
 ```
 
-Current results: 12 Terraform tests pass, `validate` is clean, `tflint` reports nothing, Checkov reports 2,108 passed and 0 failed, and 23 app tests pass.
+Current results: 13 Terraform tests pass, `validate` is clean, `tflint` reports nothing, Checkov reports 2,111 passed, 0 failed and 63 skipped (each skip justified inline or in `.checkov.yaml`), and 44 app tests pass.
 
 ---
 
@@ -205,6 +228,6 @@ Production adds a second region, an ARC cluster and larger capacity; do not depl
 - **ALB to target is HTTP inside the VPC.** TLS 1.3 terminates at the ALB as specified; the hop runs only between SG-locked private subnets. End-to-end TLS can be added with a sidecar if required.
 - **ALB access-log bucket uses SSE-S3**, because ELB log delivery does not support SSE-KMS.
 - **The deploy role uses `PowerUserAccess` plus scoped IAM.** It can only create roles that carry the workload permissions boundary, and it cannot modify CI roles or the boundary itself.
-- **Endpoint policies** list explicit API actions and restrict callers to this account (`aws:PrincipalAccount`); identity policies scope the resources.
+- **Endpoint policies** restrict callers to this account (`aws:PrincipalAccount`); most list explicit actions, but the DynamoDB gateway endpoint allows `dynamodb:*` on this account's tables. Identity policies scope the resources.
 - **Checkov exceptions** are annotated inline with `#checkov:skip=<id>:<reason>`; global skips (cross-module false positives) are listed and explained in [`.checkov.yaml`](.checkov.yaml).
 - **Third-party actions** are pinned to major versions for readability; pin them to commit SHAs (for example with Dependabot or `pinact`) before production use.

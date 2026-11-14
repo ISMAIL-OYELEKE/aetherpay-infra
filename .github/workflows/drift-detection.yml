@@ -39,6 +39,9 @@ jobs:
     concurrency:
       group: terraform-state-${{ matrix.environment }}
       cancel-in-progress: false
+      # Without this GitHub keeps only one pending run per group and replaces it
+      # with the next one, so a waiting apply could be dropped. max keeps them all.
+      queue: max
     permissions:
       contents: read
       id-token: write
@@ -109,20 +112,25 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
+      # Runs on any failure too: if OIDC, tfvars or init fails, the plan step
+      # never runs and its outputs are empty, so they default to "error" and
+      # the stage says where it stopped.
       - name: alert Slack and PagerDuty
-        if: steps.plan.outputs.status != 'clean'
+        if: ${{ !cancelled() && steps.plan.outputs.status != 'clean' }}
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           PAGERDUTY_ROUTING_KEY: ${{ secrets.PAGERDUTY_ROUTING_KEY }}
-          STATUS: ${{ steps.plan.outputs.status }}
-          EXIT_CODE: ${{ steps.plan.outputs.exit_code }}
+          REQUIRE_ALERT_DESTINATION: ${{ vars.REQUIRE_ALERT_DESTINATION || 'false' }}
+          STATUS: ${{ steps.plan.outputs.status || 'error' }}
+          STAGE: ${{ steps.plan.outputs.status && 'plan' || 'before plan (credentials, tfvars or init)' }}
+          EXIT_CODE: ${{ steps.plan.outputs.exit_code || 'n/a' }}
           ENVIRONMENT: ${{ matrix.environment }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           DRIFT_FILE: ${{ env.WORKDIR }}/drifted.txt
         run: scripts/drift-alert.sh
 
       - name: fail on drift or error
-        if: steps.plan.outputs.status != 'clean'
+        if: ${{ !cancelled() && steps.plan.outputs.status != 'clean' }}
         run: |
-          echo "::error::${{ matrix.environment }}: ${{ steps.plan.outputs.status }} (exit ${{ steps.plan.outputs.exit_code }})"
+          echo "::error::${{ matrix.environment }}: ${{ steps.plan.outputs.status || 'error before plan' }} (exit ${{ steps.plan.outputs.exit_code || 'n/a' }})"
           exit 1
